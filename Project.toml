@@ -1,0 +1,13 @@
+name = "WVTICs"
+uuid = "97132941-3266-4813-993f-c2569ff71c14"
+authors = ["Ludwig Böss"]
+version = "0.1.0"
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

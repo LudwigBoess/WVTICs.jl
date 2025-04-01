@@ -1,0 +1,23 @@
+using WVTICs
+using Documenter
+
+DocMeta.setdocmeta!(WVTICs, :DocTestSetup, :(using WVTICs); recursive=true)
+
+makedocs(;
+    modules=[WVTICs],
+    authors="Ludwig Böss",
+    sitename="WVTICs.jl",
+    format=Documenter.HTML(;
+        canonical="https://LudwigBoess.github.io/WVTICs.jl",
+        edit_link="main",
+        assets=String[],
+    ),
+    pages=[
+        "Home" => "index.md",
+    ],
+)
+
+deploydocs(;
+    repo="github.com/LudwigBoess/WVTICs.jl",
+    devbranch="main",
+)
