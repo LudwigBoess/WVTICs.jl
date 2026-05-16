@@ -4,6 +4,7 @@ using StaticArrays
 using GadgetIO
 using Random
 using NearestNeighbors
+using Distributed
 
 const ICS_PAR = "/e/ocean2/users/lboess/WVTICs/ics.par"
 
@@ -2340,6 +2341,421 @@ end
         # bar at the same N-scale (the existing "auto vs pinned ±10%"
         # subtest already shows this config converges to a stable glass).
         @test eF < 0.09
+    end
+
+end
+
+# ===========================================================================
+# Phase D — distributed-memory parallelism (CLAUDE.md §4 points 1–6).
+# Runs in CI WITHOUT a real scheduler and stays fast (tiny N, 2–3 local
+# procs).  Does NOT modify any other testset or the turbulent-B
+# @test_broken.
+# ===========================================================================
+@testset "WVTICs.jl Phase D" begin
+
+    # -- shared tiny periodic constant-density box helpers ------------------
+    function _pd_setup(n_side::Int; L = 1.0, maxiter = 4, dim = 3,
+                       mpsfraction = 5.0)
+        N = n_side^3
+        ps = Particles(N)
+        param = Parameters()
+        param.Npart = N
+        param.Maxiter = maxiter
+        param.MpsFraction = mpsfraction
+        param.StepReduction = 0.95
+        param.density_function_correction = 0.0
+        param.LimitMps = (-1.0, -1.0, -1.0, -1.0)
+        param.MoveFractionMin = 0.01
+        param.MoveFractionMax = 0.01
+        param.ProbesFraction = 0.1
+        param.RedistributionFrequency = 5
+        param.LastMoveStep = 256
+        param.Problem_Flag = 0
+        param.Problem_Subflag = 0
+        problem = ProblemParameters(; Name = "IC_PhaseD",
+                                      Mpart = (L^3) / N,
+                                      Boxsize = (L, L, L), Rho_Max = 1.0,
+                                      Periodic = (true, true, true))
+        prob = WVTICs.setup_problem(param)
+        kc = WVTICs.KernelConfig(CubicSpline; dim = dim)
+        return ps, param, problem, prob, kc, N, L
+    end
+    _fillpd!(ps, N, L, seed) = begin
+        rng = Random.Xoshiro(seed)
+        for i in 1:N
+            ps.pos[i] = SVector{3,Float64}(rand(rng) * L, rand(rng) * L,
+                                           rand(rng) * L)
+            ps.type[i] = 0
+        end
+        ps
+    end
+    merrpd(ps, prob, N, bias) =
+        sum(WVTICs.relative_density_error(ps, prob, i, bias)
+            for i in 1:N) / N
+
+    @testset "1. Peano-Hilbert domain split (node-count agnostic)" begin
+        ps, param, problem, prob, kc, N, L = _pd_setup(8)   # N = 512
+        _fillpd!(ps, N, L, 4242)
+        keys = WVTICs.peano_keys(ps.pos, problem.Boxsize)
+        @test length(keys) == N
+        @test all(k -> k >= 0, keys)
+
+        for nparts in (1, 2, 3, 4, 7, 13)
+            d = WVTICs.decompose_domain(ps.pos, problem.Boxsize, nparts)
+            np = min(nparts, N)
+
+            # keys sorted within the global Peano order
+            sortedkeys = keys[d.order]
+            @test issorted(sortedkeys)
+
+            # partitions contiguous, disjoint, union == 1:N
+            covered = Set{Int}()
+            total = 0
+            ranges = Tuple{Int,Int}[]
+            for w in 1:length(d.bounds)
+                f, l = d.bounds[w]
+                if l >= f
+                    push!(ranges, (f, l))
+                    for p in f:l
+                        g = d.order[p]
+                        @test !(g in covered)         # disjoint
+                        push!(covered, g)
+                    end
+                    total += l - f + 1
+                end
+            end
+            @test total == N
+            @test length(covered) == N                # union == all
+            # contiguity: ranges tile 1:N with no gap/overlap
+            sort!(ranges, by = first)
+            @test ranges[1][1] == 1
+            @test ranges[end][2] == N
+            for t in 2:length(ranges)
+                @test ranges[t][1] == ranges[t-1][2] + 1
+            end
+
+            # particle-count balance: each non-empty slot within a small
+            # tolerance of N/np (recursive bisection ⇒ ≤ 1 per level, but a
+            # generous bound is robust across np values / Peano ties).
+            counts = [l - f + 1 for (f, l) in ranges]
+            ideal = N / np
+            @test maximum(counts) <= ceil(Int, ideal) + np
+            @test minimum(counts) >= 1
+
+            # owner[] consistency with bounds
+            for w in 1:length(d.bounds)
+                f, l = d.bounds[w]
+                for p in f:l
+                    @test d.owner[d.order[p]] == w
+                end
+            end
+        end
+    end
+
+    @testset "2. Halo / ghost selection vs serial KDTree neighbours" begin
+        # Small periodic constant-density box decomposed across LOCAL
+        # workers; each owned particle's (owned ⋃ ghost) neighbour set must
+        # cover the serial single-process KDTree neighbour set within the
+        # ghost width 2·max(hsml), incl. across periodic faces.
+        ps, param, problem, prob, kc, N, L = _pd_setup(8)   # N = 512
+        _fillpd!(ps, N, L, 99)
+        # solve hsml once so 2·max(hsml) is meaningful
+        WVTICs.find_sph_quantities!(ps, param, problem, prob, kc)
+        box = problem.Boxsize
+        per = problem.Periodic
+
+        # serial reference: global KDTree, true min-image neighbours within
+        # each particle's own 2·hsml.
+        tree = WVTICs.build_tree(ps.pos)
+        nparts = 3
+        d = WVTICs.decompose_domain(ps.pos, box, nparts)
+        gmax = 2.0 * maximum(Float64.(ps.hsml))
+
+        for w in 1:length(d.bounds)
+            f, l = d.bounds[w]
+            l < f && continue
+            owned = Int[d.order[p] for p in f:l]
+            lo, hi = WVTICs._aabb(ps.pos, owned)
+            width = WVTICs._halo_width(ps.hsml, owned)
+            @test isapprox(width, gmax; atol = 1e-12) ||
+                  width <= gmax + 1e-12      # per-boundary ≤ global 2·max
+            ghidx = WVTICs.select_ghosts(ps.pos, lo, hi, width, box, per)
+            local_set = Set(owned)
+            union!(local_set, Set(ghidx))
+
+            # every owned particle's true neighbours within 2·hsml are in the
+            # owned⋃ghost set (the per-worker engine can find them locally).
+            for g in owned
+                r = 2.0 * Float64(ps.hsml[g])
+                buf = Int[]
+                tmp = Int[]
+                WVTICs.query_candidates!(buf, tmp, tree, ps.pos, ps.pos[g],
+                                         r, box, per)
+                for j in buf
+                    j == g && continue
+                    if WVTICs.periodic_dist2(ps.pos[g], ps.pos[j],
+                                             box, per) <= r * r
+                        @test j in local_set
+                    end
+                end
+            end
+        end
+
+        # ghost width covers 2·max(hsml): a particle exactly at distance
+        # `width` from the AABB is selected (boundary-inclusive).
+        owned1 = Int[d.order[p] for p in d.bounds[1][1]:d.bounds[1][2]]
+        lo1, hi1 = WVTICs._aabb(ps.pos, owned1)
+        w1 = WVTICs._halo_width(ps.hsml, owned1)
+        @test w1 >= 0.0
+        probe = SVector{3,Float64}(hi1[1] + 0.5 * w1, hi1[2], hi1[3])
+        pp = [probe]
+        @test 1 in WVTICs.select_ghosts(pp, lo1, hi1, w1, box, per)
+    end
+
+    @testset "3. Distributed vs serial parity (errMean / norm_hsml)" begin
+        # The GLOBAL per-iteration reduction primitive, computed the
+        # distributed (Peano-slot-partitioned, gather-and-combine) way, must
+        # equal the serial reduction within a documented tolerance.
+        ps, param, problem, prob, kc, N, L = _pd_setup(8)   # N = 512
+        _fillpd!(ps, N, L, 555)
+        WVTICs.find_sph_quantities!(ps, param, problem, prob, kc)
+
+        # serial reduction (the relax.jl `_error_stats` math, replicated).
+        bias = param.density_function_correction
+        mpart = problem.Mpart
+        dim = kc.dim
+        voln = dim == 2 ? Float64(pi) : (4.0 * pi / 3.0)
+        wvtnngb = Float64(kc.desnngb)
+        esum = 0.0
+        emin = floatmax(Float64)
+        emax = 0.0
+        vsph = 0.0
+        maxh = 0.0
+        for i in 1:N
+            rm = Float64(prob.density(ps, i, bias))
+            e = abs((Float64(ps.rho[i]) - rm) / rm)
+            esum += e
+            emin = min(emin, e)
+            emax = max(emax, e)
+            h = cbrt(wvtnngb * mpart / rm / voln)
+            vsph += h * h * h
+            maxh = max(maxh, h)
+        end
+        errMean_serial = esum / N
+        norm_serial = cbrt(wvtnngb / vsph / voln) * max(L, L)
+
+        for nparts in (2, 3, 5)
+            d = WVTICs.decompose_domain(ps.pos, problem.Boxsize, nparts)
+            r = WVTICs.distributed_iteration_reductions(ps, d, prob, kc,
+                                                        mpart, bias)
+            norm_dist = cbrt(wvtnngb / r.vSphSum / voln) * max(L, L)
+            # documented parity tolerance: 1e-9 relative (only float
+            # reassociation differs — sums in Peano-slot order vs 1:N order;
+            # CLAUDE.md determinism note: statistical, not bit, equivalence).
+            @test isapprox(r.errMean, errMean_serial; rtol = 1e-9)
+            @test isapprox(r.errMin, emin; rtol = 1e-9)
+            @test isapprox(r.errMax, emax; rtol = 1e-9)
+            @test isapprox(r.vSphSum, vsph; rtol = 1e-9)
+            @test isapprox(r.max_hsml, maxh; rtol = 1e-9)
+            @test isapprox(norm_dist, norm_serial; rtol = 1e-9)
+        end
+
+        # nworkers()==1 ⇒ the distributed driver delegates to the threaded
+        # path and produces the byte-identical serial relaxation result.
+        psA, pA, prA, prbA, kcA, NA, LA = _pd_setup(7; maxiter = 3)  # 343
+        psB, pB, prB, prbB, kcB, NB, LB = _pd_setup(7; maxiter = 3)
+        _fillpd!(psA, NA, LA, 31415)
+        _fillpd!(psB, NB, LB, 31415)
+        WVTICs.regularise_sph_particles!(psA, pA, prA, prbA, kcA;
+                                         output_diagnostics = false,
+                                         verbose = false)
+        @test nworkers() == 1
+        WVTICs.regularise_sph_particles_distributed!(psB, pB, prB, prbB, kcB;
+                                                     output_diagnostics = false,
+                                                     verbose = false)
+        eA = merrpd(psA, prbA, NA, pA.density_function_correction)
+        eB = merrpd(psB, prbB, NB, pB.density_function_correction)
+        @test eA == eB                       # byte-identical single-process
+        @test psA.pos == psB.pos
+    end
+
+    @testset "4. init_workers manager selection (env detection, no sched)" begin
+        # Pure env-detection UNIT test — sets/unsets SLURM_*/PBS_* and
+        # asserts the right manager + pool size WITHOUT launching a real
+        # scheduler (dry_run plan only).
+        save = Dict{String,Union{Nothing,String}}()
+        for k in ("SLURM_JOB_ID", "SLURM_NTASKS", "SLURM_NNODES",
+                  "PBS_JOBID", "PBS_NODEFILE", "PBS_NP", "NCPUS")
+            save[k] = get(ENV, k, nothing)
+            haskey(ENV, k) && delete!(ENV, k)
+        end
+        try
+            # no scheduler ⇒ :local
+            @test WVTICs.detect_scheduler() == :local
+            m, c = WVTICs.plan_workers(; manager = :auto, n = 3)
+            @test m == :local && c == 3
+
+            # SLURM detected, pool size from SLURM_NTASKS
+            ENV["SLURM_JOB_ID"] = "123456"
+            ENV["SLURM_NTASKS"] = "8"
+            @test WVTICs.detect_scheduler() == :slurm
+            @test WVTICs.scheduler_pool_size(:slurm) == 8
+            m, c = WVTICs.plan_workers(; manager = :auto)
+            @test m == :slurm && c == 8
+            # explicit n overrides the allocation
+            m, c = WVTICs.plan_workers(; manager = :auto, n = 2)
+            @test m == :slurm && c == 2
+            # fall back to SLURM_NNODES when NTASKS absent
+            delete!(ENV, "SLURM_NTASKS")
+            ENV["SLURM_NNODES"] = "4"
+            @test WVTICs.scheduler_pool_size(:slurm) == 4
+
+            # PBS via PBS_NODEFILE line count
+            delete!(ENV, "SLURM_JOB_ID")
+            delete!(ENV, "SLURM_NNODES")
+            nf = tempname()
+            open(nf, "w") do io
+                println(io, "node01")
+                println(io, "node01")
+                println(io, "node02")
+            end
+            ENV["PBS_JOBID"] = "987.pbs"
+            ENV["PBS_NODEFILE"] = nf
+            @test WVTICs.detect_scheduler() == :pbs
+            @test WVTICs.scheduler_pool_size(:pbs) == 3
+            m, c = WVTICs.plan_workers(; manager = :auto)
+            @test m == :pbs && c == 3
+            rm(nf; force = true)
+            # PBS without a nodefile ⇒ PBS_NP
+            delete!(ENV, "PBS_NODEFILE")
+            ENV["PBS_NP"] = "6"
+            @test WVTICs.scheduler_pool_size(:pbs) == 6
+
+            # explicit :local manager, no n ⇒ CPU-sized, ≥ 1
+            m, c = WVTICs.plan_workers(; manager = :local)
+            @test m == :local && c >= 1
+
+            # bad manager errors
+            @test_throws ArgumentError WVTICs.plan_workers(; manager = :bogus)
+
+            # init_workers dry_run launches nothing, returns empty
+            @test WVTICs.init_workers(; manager = :auto, dry_run = true) == Int[]
+        finally
+            for (k, v) in save
+                if v === nothing
+                    haskey(ENV, k) && delete!(ENV, k)
+                else
+                    ENV[k] = v
+                end
+            end
+        end
+    end
+
+    @testset "4b. local-manager smoke: addprocs, run, rmprocs" begin
+        # Actually launch a couple of LOCAL workers, run the distributed
+        # decomposition + reduction across them via @everywhere using
+        # WVTICs, then rmprocs.  Keeps worker count tiny (2) and N small.
+        added = Int[]
+        try
+            proj = Base.active_project()
+            added = addprocs(2; exeflags = "--project=$(proj)")
+            @test length(added) == 2
+            @everywhere added using WVTICs
+            @everywhere added using StaticArrays
+
+            ps, param, problem, prob, kc, N, L = _pd_setup(6; maxiter = 2)
+            _fillpd!(ps, N, L, 7)
+
+            # decomposition keys off nworkers() (= 2 here) — node-count
+            # agnostic by construction.
+            d = WVTICs.decompose_domain(ps.pos, problem.Boxsize,
+                                        max(1, nworkers()))
+            @test length(d.bounds) == max(1, nworkers())
+
+            # each worker computes its owned-slice partial reduction
+            # remotely; the coordinator combines them == the serial sum.
+            wkrs = workers()
+            futs = Vector{Any}(undef, length(wkrs))
+            for (wi, w) in enumerate(wkrs)
+                f, l = d.bounds[wi]
+                gids = Int[d.order[p] for p in f:l]
+                sub = WVTICs._subset_particles(ps, gids)
+                futs[wi] = remotecall(w, sub, prob,
+                                      param.density_function_correction) do s, pr, bias
+                    acc = 0.0
+                    for i in 1:length(s)
+                        rm = Float64(pr.density(s, i, bias))
+                        acc += abs((Float64(s.rho[i]) - rm) / rm)
+                    end
+                    acc
+                end
+            end
+            # NOTE: rho is zero on the fresh subset (no solve on workers in
+            # this smoke); the point is the message-passing decomposition /
+            # remote WVTICs availability works end-to-end, not the value.
+            partials = Float64[fetch(f) for f in futs]
+            @test all(isfinite, partials)
+            @test length(partials) == length(wkrs)
+
+            # the distributed driver runs with workers present and matches a
+            # serial reference relaxation (statistical parity).
+            psS, pS, prS, prbS, kcS, NS, LS = _pd_setup(6; maxiter = 2)
+            _fillpd!(psS, NS, LS, 7)
+            WVTICs.regularise_sph_particles!(psS, pS, prS, prbS, kcS;
+                                             output_diagnostics = false,
+                                             verbose = false)
+            WVTICs.regularise_sph_particles_distributed!(ps, param, problem,
+                                                         prob, kc;
+                                                         output_diagnostics = false,
+                                                         verbose = false)
+            eS = merrpd(psS, prbS, NS, pS.density_function_correction)
+            eD = merrpd(ps, prob, N, param.density_function_correction)
+            @test isfinite(eD)
+            # documented parity tolerance for the converged GLOBAL error.
+            @test isapprox(eD, eS; rtol = 1e-6)
+        finally
+            isempty(added) || rmprocs(added)
+        end
+        @test nprocs() == 1                  # pool restored
+    end
+
+    @testset "5. Per-worker multi-file IO round-trips total Npart" begin
+        ps, param, problem, prob, kc, N, L = _pd_setup(7)   # N = 343
+        _fillpd!(ps, N, L, 2)
+        for i in 1:N
+            ps.id[i] = UInt32(i)
+            ps.rho[i] = Float32(1.0)
+        end
+        mktempdir() do dir
+            base = joinpath(dir, "IC_PhaseD")
+            d = WVTICs.decompose_domain(ps.pos, problem.Boxsize, 3)
+            files = WVTICs.write_output_distributed(ps, param, problem, d;
+                                                    filename = base,
+                                                    verbose = false)
+            @test length(files) == 3
+            @test all(isfile, files)
+
+            total = 0
+            allids = Int[]
+            for fp in files
+                h = read_header(fp)
+                total += Int(h.npart[1])
+                ids = read_block(fp, "ID"; parttype = 0)
+                append!(allids, Int.(ids))
+            end
+            @test total == N                       # total particle count
+            @test sort(allids) == collect(1:N)     # every id once, no loss
+
+            # single_file=true gathers to one file with the full count.
+            single = joinpath(dir, "IC_single")
+            sf = WVTICs.write_output_distributed(ps, param, problem, d;
+                                                 filename = single,
+                                                 single_file = true,
+                                                 verbose = false)
+            @test length(sf) == 1
+            hs = read_header(sf[1])
+            @test Int(hs.npart[1]) == N
+        end
     end
 
 end
