@@ -1,0 +1,66 @@
+# WVTICs - simple TOML example initial-condition parameter file.
+#
+# This is the SIMPLE TOML example IC. It uses the TOML data format instead of
+# the C-style ASCII `tag value` format of `ics.par`, and sets up a much
+# smaller / quicker test: constant-density Problem 0.0 (the simplest problem,
+# no velocity, no magnetic field) with a small particle count and a short
+# relaxation. It is meant to parse to a valid `Parameters` and be runnable by
+# `main("parameters.toml")` in seconds for smoke testing.
+#
+# Schema: a single FLAT top-level table. The keys are exactly the same tags
+# as the ASCII format (1:1). Required keys: Npart, Maxiter, Problem_Flag,
+# Problem_Subflag. All other keys are optional and default to 0/0.0 if
+# omitted. (The PNG_Filename tag is out of scope and unsupported.)
+#
+# Well-posed redistribution parameters (mirroring ics.par's healthy
+# proportions): RedistributionFrequency = 5 with LastMoveStep = 10 gives
+# the redistribution decay denominator div(LastMoveStep,
+# RedistributionFrequency) - 1 = div(10, 5) - 1 = 1 > 0, so the decay is
+# finite and the redistribution step is exercised cleanly within the short
+# Maxiter = 10 run.  With MoveFractionMax == MoveFractionMin the decay is
+# log(1) = 0 ⇒ a constant moveFraction (= MoveFractionMax) — well-defined.
+# (The earlier LastMoveStep = RedistributionFrequency = 5 gave denom = 0
+# and, with MoveFractionMax == MoveFractionMin, a 0/0 = NaN decay — the
+# degenerate combo the relaxation loop now also guards against; see
+# PORT_STATUS.md.)
+
+# --- Resolution / relaxation (small, for a quick test) ---
+Npart   = 2000
+Maxiter = 10
+
+# MpsFraction sets the initial WVT step (fraction of the mean particle
+# separation). DEFAULT IS AUTO: omit this key, set it to 0.0, or set it to
+# the string "auto" to let the relaxation auto-calibrate the step at startup
+# (analytic seed ~0.8 in 3D / ~0.1 in 2D + a short log-bisection safety net
+# into the stable band) — no per-problem / per-N hand-tuning needed. Set a
+# finite POSITIVE number to pin it to the exact legacy behaviour
+# (step = 1/(npart_1D * MpsFraction)); the C reference used 5.0 for 3D /
+# 0.1 for 2D. This example keeps the legacy pinned value for a deterministic
+# smoke run.
+MpsFraction   = 5.0
+StepReduction = 0.95
+
+# Convergence criterion for particle movement, thresholds for fractions
+# 1, 0.1, 0.01, 0.001 of the mean particle separation. Map onto LimitMps[1..4].
+LimitMps     = -1.0
+LimitMps10   = -1.0
+LimitMps100  = -1.0
+LimitMps1000 = 1.0
+
+# --- Monte-Carlo redistribution ---
+MoveFractionMin         = 0.01
+MoveFractionMax         = 0.01
+ProbesFraction          = 0.1
+RedistributionFrequency = 5
+LastMoveStep            = 10
+
+# --- Artificial density-model correction (compensates imperfect WVT
+#     convergence; C `Param.BiasCorrection`). The legacy key `BiasCorrection`
+#     is still accepted by the loader for back-compatibility. ---
+density_function_correction = 0.0
+
+# --- Problem selection ---
+# 0 - Simple periodic tests
+#   0 - Constant Density   <-- this file
+Problem_Flag    = 0
+Problem_Subflag = 0
