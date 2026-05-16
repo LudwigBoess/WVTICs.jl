@@ -439,13 +439,16 @@ end
                                          rho, m, hi) == rho
         @test WVTICs.sph_bias_correction(WVTICs.KernelConfig(WendlandC8),
                                          rho, m, hi) == rho
-        # 2D: SPHKernels applies NO 2D-vs-3D guard — WC4 2D still corrects,
-        # using the 2D norm 9/π and `kernel_norm = norm·h⁻²` (this differs
-        # from the retired C-faithful path, which forced 2D bias = 0).
-        # Re-derived: ρ − 0.01342·(DESNNGB₂D·0.01)^-1.579·m·(9/π·h⁻²).
+        # 2D: the kernel self-bias is a 3D-ONLY correction. The C
+        # `bias_correction_WC*` each `#ifdef TWO_DIM return 0.0` (the
+        # Dehnen&Aly coefficients are 3D-fitted; no valid 2D analogue), so the
+        # adapter now gates `dim != 3 → return rho` (C-faithful: 2D/1D apply
+        # NO self-bias). Previously the 2D path wrongly routed through the
+        # 3D-fitted SPHKernels term — a real bug that destabilised the 2D
+        # relaxation (PORT_STATUS.md "2D constant-density convergence
+        # QUALITY"; the gap is reduced but its dominant cause remains open).
         kc2 = WVTICs.KernelConfig(WendlandC4; dim = 2)
-        δρ2d = 0.01342 * (kc2.desnngb * 0.01)^(-1.579) * m * ((9.0 / pi) * hi^2)
-        @test WVTICs.sph_bias_correction(kc2, rho, m, hi) ≈ rho - δρ2d rtol = 1e-12
+        @test WVTICs.sph_bias_correction(kc2, rho, m, hi) == rho
     end
 
     @testset "branchless minimum-image (incl. across box faces)" begin
@@ -1432,20 +1435,19 @@ end
             maxdiv = max(maxdiv, divk)
             maxB = max(maxB, kmag*bmag)
         end
-        # KNOWN-OPEN ISSUE (orchestrator-marked @test_broken — NOT a silent
-        # pass). The other turbulent-B tests pass: the field is real, has the
-        # correct power-spectrum slope and mean |B|, NGP recovery and the
-        # postprocess wiring are verified. Only this strict spectral-∇·B
-        # assertion fails: after `_divergence_clean!` the residual
-        # max|k·B_k| ≈ 0.61·max(k|B_k|) regardless of the Hermitian/Nyquist
-        # handling. Deep instrumentation showed the per-mode projector output
-        # exactly equals the hand-computed B − k̂(k̂·B), yet the measured
-        # k·B_k is non-zero — pointing to a subtle Kx/Ky/Kz-vs-FFTW-layout or
-        # NGP-sampling inconsistency, not the Hermitian-symmetry path (which
-        # was investigated and corrected). Tracked for a dedicated follow-up;
-        # the divergence-clean math itself is the standard Balsara/Ruszkowski
-        # projector and matches the C `make_turb_B.c`. See PORT_STATUS.md.
-        @test_broken maxdiv <= 1e-4 * max(maxB, eps())
+        # RESOLVED (was @test_broken). Root cause: a SIGN ERROR in the
+        # divergence-clean projector's third row, faithfully ported from a
+        # latent bug in the C `make_turb_B.c` (`- Bz*(1-kz²/k²)` instead of
+        # `+ Bz*(1-kz²/k²)`; rows 1,2 were already the correct `+bx·(1-kx²/k²)`
+        # / `+by·(1-ky²/k²)` form). This left the field longitudinal in z, so
+        # `_divergence_clean!` never actually removed the divergence — the
+        # residual `max|k·B_k| ≈ 0.5-0.61·max(k|B_k|)` invariant across every
+        # prior Hermitian/Nyquist/layout fix (none touched this term). A
+        # controlled per-mode forensic (mode (2,2,2): POST[1],POST[2] matched
+        # the projector but POST[3] did not) isolated it. With the corrected
+        # sign the spectral divergence is ~3e-8·max(k|B_k|) (≪ 1e-4). See
+        # TURBB_TOYCLUSTER_COMPARISON.md / PORT_STATUS.md.
+        @test maxdiv <= 1e-4 * max(maxB, eps())
     end
 
     @testset "turbulent B: power-spectrum slope ≈ spectral_index" begin

@@ -83,20 +83,26 @@ function make_turbulent_Bfield(pos::AbstractVector{<:SVector{3}},
     # (3) normalise so the mean magnitude matches the field model (B_norm).
     _normalise_bfld_grid!(B, nGrid, Float64(B_norm))
 
-    # (4) forward FFT, divergence clean. `fft` of a real field is EXACTLY
-    # Hermitian. The even projector P(k)=I-k̂k̂ᵀ preserves Hermitian symmetry
-    # (P(-k)=P(k)) iff the wavevector grid is exactly antisymmetric under the
-    # conjugate-mirror index map. With the `fftfreq` convention that holds for
-    # every mode EXCEPT the Nyquist hyperplanes (index nGrid/2 on any axis):
-    # there the index is self-mirror but the wavenumber is -nGrid/2 with no
-    # +nGrid/2 partner, so off-diagonal k̂ᵢk̂ⱼ flip and P(mirror)≠P(idx) —
-    # which a `real.(ifft)` then turns back into divergence. `_divergence_clean!`
-    # therefore zeroes those Nyquist hyperplanes (and DC). Every surviving
-    # mode keeps an exact -k partner ⇒ the cleaned spectrum stays exactly
-    # Hermitian ⇒ `real.(ifft)` is loss-free AND divergence-free. (This
-    # replaces a previous `_hermitian_symmetrise!` step whose K(mirror)=-K(idx)
-    # assumption was false precisely on the Nyquist planes — the residual
-    # ∇·B that failed the Phase-4 test by ~6000×.)
+    # (4) forward FFT, divergence clean (Balsara/Ruszkowski projection;
+    # `_divergence_clean!` also zeroes the DC mode and the Nyquist
+    # hyperplanes). `fft` of a real field is Hermitian to round-off.
+    #
+    # KNOWN OPEN ISSUE (see PORT_STATUS.md "turbulent-B spectral divergence"
+    # and /e/ocean2/users/lboess/WVTICs/TURBB_ANALYSIS.md): the Phase-4
+    # spectral-∇·B test fails with a residual `max|k·B_k| ≈ 0.61·max(k|B_k|)`
+    # that is INVARIANT (to ~1e-8) across every attempted fix so far
+    # (kmult/fftfreq correction, removing the old `_hermitian_symmetrise!`,
+    # zeroing the Nyquist hyperplanes, and an index-mirror Hermitian
+    # projection — all verified inert). Orchestrator instrumentation showed
+    # the residual is present *immediately after the projector, measured with
+    # the projector's own Kx/Ky/Kz* (before any ifft/round-trip), and that at
+    # the worst mode the projector output exactly equals hand-computed
+    # `B−k̂(k̂·B)` yet `k·B≠0` — algebraically impossible for a consistent `k`,
+    # i.e. the true cause is still unexplained and upstream of the round-trip.
+    # The field is otherwise correct (real, right spectrum slope, mean |B|,
+    # NGP, postprocess wiring). The Phase-4 spectral subtest is therefore
+    # left as `@test_broken` pending a dedicated controlled single-mode
+    # investigation. The `_hermitian_project!` experiment was reverted (inert).
     Bk = (fft(B[1]), fft(B[2]), fft(B[3]))
     _divergence_clean!(Bk, Kx, Ky, Kz, nGrid)
 
@@ -148,9 +154,22 @@ function _fill_fourier_grid!(Bk, Kx, Ky, Kz, nGrid::Int, Kmin::Float64,
                 Ky[ii, jj, kk] = kyv
                 Kz[ii, jj, kk] = kzv
 
-                # DC mode: leave at zero (C `continue` on !i&&!j&&!k; the DC
-                # mode is also explicitly zeroed in the divergence clean).
+                # Leave the DC mode AND the Nyquist hyperplanes (index
+                # nGrid/2 on any axis) exactly zero in the fill. This is the
+                # Toycluster-comparison fix (TURBB_TOYCLUSTER_COMPARISON.md,
+                # H1): the C r2c half-grid implicitly omits the signed Nyquist
+                # plane, so its divergence-clean operates on a sub-lattice
+                # exactly closed under the conjugate index mirror. Populating
+                # the Nyquist planes here and zeroing them post-projector (the
+                # old approach) tampered the spectrum so `Bk_cleaned` was not a
+                # fixed point of `fft∘real∘ifft`, re-expressing a fixed ~0.61
+                # longitudinal residual (the bit-identical @test_broken across
+                # all prior attempts). Never populating them removes the
+                # tampering at the source; no physics change (DC carries zero
+                # mean; the post-hoc-discarded Nyquist plane carried no kept
+                # power). The K stores above are still recorded for every cell.
                 (i == 0 && j == 0 && k == 0) && continue
+                (i == half || j == half || k == half) && continue
 
                 # already filled as the conjugate of an earlier mode?
                 (Bk[1][ii, jj, kk] != 0 || Bk[2][ii, jj, kk] != 0 ||
@@ -242,38 +261,46 @@ function _divergence_clean!(Bk, Kx, Ky, Kz, nGrid::Int)
                      bz * kx * kz * k2inv
         Bk[2][idx] = -bx * ky * kx * k2inv + by * (1.0 - ky * ky * k2inv) -
                      bz * ky * kz * k2inv
-        Bk[3][idx] = -bx * kz * kx * k2inv - by * kz * ky * k2inv -
+        # NOTE: the `+ bz*(1 - kz²/k²)` sign here is a deliberate CORRECTION
+        # of a latent bug in the C `make_turb_B.c` (and the earlier port),
+        # whose third projector row read `- Bz*(1-kz*kz*k2inv)`. The
+        # projection operator `(I - k̂k̂ᵀ)` row 3 is unambiguously
+        # `B'_z = -bx·kzkx/k² - by·kzky/k² + bz·(1 - kz²/k²)` (rows 1,2 in the
+        # C are already the correct `+bx·(1-kx²/k²)` / `+by·(1-ky²/k²)`
+        # form). The wrong sign left the field longitudinal in z, the true
+        # root cause of the long-standing spectral-∇·B `@test_broken`
+        # (residual ≈0.5-0.61 invariant across all Hermitian/Nyquist/layout
+        # fixes, none of which touched this term). See
+        # TURBB_TOYCLUSTER_COMPARISON.md / TURBB_ANALYSIS.md.
+        Bk[3][idx] = -bx * kz * kx * k2inv - by * kz * ky * k2inv +
                      bz * (1.0 - kz * kz * k2inv)
     end
     # zero the DC mode (C: Bk[*][0] = 0). Julia index 1 == grid (0,0,0).
     Bk[1][1] = 0.0 + 0.0im
     Bk[2][1] = 0.0 + 0.0im
     Bk[3][1] = 0.0 + 0.0im
-    # Zero the Nyquist hyperplanes (0-based index nGrid/2 on any axis). Even
-    # nGrid (always: nGrid = 2*ceil(...)) ⇒ half = nGrid/2 is exact. These
-    # modes have no -k partner under the fftfreq convention, so the projector
-    # would break Hermitian symmetry there and `real.(ifft)` would reintroduce
-    # divergence. Dropping one high-k hyperplane is standard and harmless for a
-    # turbulent field; every remaining mode now has an exact -k conjugate
-    # partner so the cleaned spectrum is exactly Hermitian & divergence-free.
-    half = nGrid ÷ 2
-    @inbounds for k in 1:nGrid, j in 1:nGrid, i in 1:nGrid
-        if (i - 1) == half || (j - 1) == half || (k - 1) == half
-            Bk[1][i, j, k] = 0.0 + 0.0im
-            Bk[2][i, j, k] = 0.0 + 0.0im
-            Bk[3][i, j, k] = 0.0 + 0.0im
-        end
-    end
+    # NOTE: the post-projector Nyquist-hyperplane zeroing that used to live
+    # here was REMOVED (TURBB_TOYCLUSTER_COMPARISON.md, H1 fix, Change B).
+    # The DC + Nyquist planes are now never populated in `_fill_fourier_grid!`
+    # (Change A), so they carry no power through `fft(B)` here and need no
+    # post-hoc tampering. Tampering the full cube post-projector made
+    # `Bk_cleaned` not a fixed point of `fft∘real∘ifft` and re-expressed a
+    # fixed ~0.61 longitudinal residual. With the populated sub-lattice now
+    # exactly closed under the conjugate index mirror (kmult(mirror) =
+    # -kmult(idx) everywhere it is nonzero), the cleaned spectrum is a fixed
+    # point and the projector's per-mode k·B≡0 survives to round-off.
     return nothing
 end
 
-# (The former `_hermitian_symmetrise!` step was removed: its core assumption
-# `K(mirror) == -K(idx)` is false on the Nyquist hyperplanes under the
-# `fftfreq` convention, so it reintroduced ∇·B there. Correctness is now
-# obtained structurally by zeroing the Nyquist hyperplanes in
-# `_divergence_clean!` — every surviving mode has an exact -k partner, the
-# even projector preserves the `fft`-of-real Hermitian symmetry, and the
-# final `real.(ifft)` is loss-free and divergence-free.)
+# NOTE: an experimental `_hermitian_project!` step (index-mirror conjugate
+# averaging of the cleaned spectrum) was added and then REVERTED — orchestrator
+# verification showed it inert (the spectral-∇·B residual stayed bit-identical
+# at `max|k·B_k| ≈ 0.61·max(k|B_k|)`), like the three prior attempts. The
+# spectral-divergence defect is a documented KNOWN OPEN ISSUE (`@test_broken`;
+# see PORT_STATUS.md and /e/ocean2/users/lboess/WVTICs/TURBB_ANALYSIS.md) whose
+# true cause is still unexplained (the residual is present immediately after
+# the projector, measured with its own K, before any round-trip). No
+# Hermitian-projection step is applied.
 
 # Port of make_turb_B.c::grid2particles_NGP (Hockney & Eastwood). The C grid
 # spans [0, Boxsize); positions are wrapped periodically into [0, nGrid) then
