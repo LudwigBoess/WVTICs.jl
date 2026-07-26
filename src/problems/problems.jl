@@ -76,6 +76,8 @@ zero_postprocess!(particles, param, problem) = nothing
 @inline _p2(a) = a * a
 @inline _p3(a) = a * a * a
 const _SQRT2 = sqrt(2.0)
+const _SQRT4PI = sqrt(4.0 * pi)     # MHD field normalisation (Gaussian units)
+const GAMMA = 5.0 / 3.0             # adiabatic index for the ideal-gas problems
 
 # --- Problem 0.0 : Constant Density (problems/constant_density.c) ----------
 
@@ -381,7 +383,7 @@ end
 # Returns (Rho::NTuple{3}, U::NTuple{3}, Velx::NTuple{3}) — the converged
 # shock-tube state, port of doubleshock.c::set_shock_tube + setup body.
 function _ds_state(subflag::Int)
-    gamma = 5.0 / 3.0
+    gamma = GAMMA
     cs0, mach0, velx2 = _DS_PARAMS[subflag + 1]
     # Rho[0] = 1e-28 * (ULength^3 / UMass); ULength/UMass = std Gadget units.
     ULength = 3.08568025e21
@@ -485,7 +487,7 @@ function setup_sod_shock(param::Parameters)
     end
     density = _sod_density
     function _sod_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         if particles.pos[ipart][1] <= 0.5 * bx
             return 1.0 / (gamma - 1.0) / 1.0       # pLeft/(γ-1)/rhoLeft
         else
@@ -745,7 +747,7 @@ function setup_zeldovich_pancake(param::Parameters)
         return SVector{3,Float64}(vx, 0.0, 0.0)
     end
     function _zp_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         temp_zero = 1.0
         kb = 1.380658e-16
         yhe = (1.0 - 0.76) / (4.0 * 0.76)
@@ -795,7 +797,7 @@ function setup_box(param::Parameters)
     density = _box_density
     velocity = (particles, ipart) -> SVector{3,Float64}(142.3, -31.3, 0.0)
     function _box_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         pressure = 2.5
         return pressure / (gamma - 1.0) / particles.rho[ipart]
     end
@@ -835,7 +837,7 @@ function setup_gresho_vortex(param::Parameters)
         end
     end
     function _gresho_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         rho = 1.0
         p = particles.pos[ipart]
         x = p[1] - bx * 0.5
@@ -969,9 +971,9 @@ function setup_rotor(param::Parameters)
         end
     end
     bfield = (particles, ipart) ->
-        SVector{3,Float64}(5.0 / sqrt(4.0 * pi), 0.0, 0.0)
+        SVector{3,Float64}(5.0 / _SQRT4PI, 0.0, 0.0)
     function _rotor_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         pressure = 1.0
         p = particles.pos[ipart]
         x = p[1] - bx * 0.5
@@ -1013,7 +1015,7 @@ function setup_strong_blast(param::Parameters)
         x = p[1] - bx * 0.5
         y = p[2] - by * 0.5
         radius = sqrt(_p2(x) + _p2(y))
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         pressure = 1.0
         if 0.0 < radius <= 0.1
             pressure = 10.0
@@ -1052,12 +1054,12 @@ function setup_orszag_tang_vortex(param::Parameters)
         p = particles.pos[ipart]
         x = p[1] / bx
         y = p[2] / by
-        s = sqrt(4.0 * pi)
+        s = _SQRT4PI
         return SVector{3,Float64}(-sin(2.0 * pi * y) / s,
                                   sin(2.0 * pi * x) / s, 0.0)
     end
     function _ot_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         pressure = 5.0 / 12.0 * pi
         return pressure / (gamma - 1.0) / rho
     end
@@ -1088,11 +1090,11 @@ function setup_linear_alfven_wave(param::Parameters)
     density = _alfven_density
     velocity = (particles, ipart) -> SVector{3,Float64}(0.0, 0.0, 0.0)
     bfield = function (particles::Particles, ipart::Int)
-        s = sqrt(4.0 * pi)
+        s = _SQRT4PI
         return SVector{3,Float64}(s * 1.0, s * _SQRT2, s * 0.5)
     end
     function _alfven_internal_energy(particles::Particles, ipart::Int)::Float64
-        gamma = 5.0 / 3.0
+        gamma = GAMMA
         pressure = 1.0 / gamma
         return pressure / (gamma - 1.0) / particles.rho[ipart]
     end
@@ -1133,7 +1135,7 @@ function setup_rayleigh_taylor(param::Parameters)
         end
     end
     bfield = (particles, ipart) ->
-        SVector{3,Float64}(0.0, sqrt(4.0 * pi) * 0.07, 0.0)
+        SVector{3,Float64}(0.0, _SQRT4PI * 0.07, 0.0)
     function _rt_internal_energy(particles::Particles, ipart::Int)::Float64
         gamma = 1.4
         rho2 = 2.0
@@ -1194,7 +1196,7 @@ an explicit error (the dispatch is complete, but a wrong IC is never
 silently produced). The PNG path (2.1) is registered to an out-of-scope
 error per the project scope decision.
 """
-const PROBLEM_REGISTRY = Dict{Tuple{Int,Int},Function}(
+const PROBLEM_REGISTRY = merge(Dict{Tuple{Int,Int},Function}(
     # 0.x — simple periodic tests
     (0, 0)  => setup_constant_density,
     (0, 1)  => setup_tophat,
@@ -1229,18 +1231,11 @@ const PROBLEM_REGISTRY = Dict{Tuple{Int,Int},Function}(
     (5, 2)  => setup_orszag_tang_vortex,
     (5, 3)  => setup_linear_alfven_wave,
     (5, 4)  => setup_rayleigh_taylor,
-    (5, 5)  => _make_ryu_jones_error(5),
-    (5, 6)  => _make_ryu_jones_error(6),
-    (5, 7)  => _make_ryu_jones_error(7),
-    (5, 8)  => _make_ryu_jones_error(8),
-    (5, 9)  => _make_ryu_jones_error(9),
-    (5, 10) => _make_ryu_jones_error(10),
-    (5, 11) => _make_ryu_jones_error(11),
-    (5, 12) => _make_ryu_jones_error(12),
-    (5, 13) => _make_ryu_jones_error(13),
-    (5, 14) => _make_ryu_jones_error(14),
-    (5, 15) => _make_ryu_jones_error(15),
-    (5, 16) => _make_ryu_jones_error(16),
+    ),
+    # Ryu-Jones shocktubes 5.5..5.16: all flagged "not working" in the C
+    # reference, registered to an explicit error so the dispatch stays complete.
+    Dict{Tuple{Int,Int},Function}(
+        (5, sub) => _make_ryu_jones_error(sub) for sub in 5:16),
 )
 
 """
