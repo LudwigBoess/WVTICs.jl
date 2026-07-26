@@ -147,75 +147,60 @@ end
 export make_sph_wvtics
 
 # --- Precompilation --------------------------------------------------------
-# Run the genuinely type-specialising hot path once at precompile time so the
-# first real call (TTFX) is fast.  The workload is hermetic and quick:
-#
-#   * It uses the constant-density problem (0.0), whose total mass is exactly
-#     1, so `Mpart = 1/Npart` is set directly — the 512³ `setup`/
-#     `mpart_from_integral` grid is intentionally skipped (it would dominate
-#     precompile time without compiling any extra user-facing method).
-#   * `regularise_sph_particles!(…, ::KernelConfig)` is run once on a tiny
-#     N: `KernelConfig` is a single concrete (non-parametric) struct, so the
-#     whole relaxation / neighbour-tree / density call tree compiles once
-#     regardless of which kernel it carries.  CubicSpline keeps `DESNNGB`
-#     well below the tiny N (robust, fast).
-#   * The per-kernel SPHKernels delegation (`sph_kernel` / `sph_kernel_deriv`
-#     / `sph_bias_correction` on the stored `kc.kernel` instance) is then
-#     forced for every supported KernelType in 2D and 3D.
-#   * The TOML parameter parser and the snapshot writer (the remaining legs
-#     of `make_sph_wvtics`) are compiled too — `write_output` into a temp
-#     dir so precompilation has no side effects.
+# Compile the hot path at precompile time so the first real call is fast. The
+# workload uses the constant-density problem (total mass exactly 1, so Mpart =
+# 1/Npart directly — the 512³ setup grid is skipped). The relaxation call tree
+# specialises per kernel type (KernelConfig{K} carries a concrete kernel), so
+# both the driver default (Wendland C4) and the cheap CubicSpline are compiled
+# through a full relaxation; the remaining kernels get their leaf value/deriv/
+# bias evaluations forced in 2D and 3D. The TOML parser and snapshot writer are
+# compiled into a temp dir so precompilation has no side effects.
 @setup_workload begin
-    npart = 64
     @compile_workload begin
-      # Silence all logging for the whole workload: the tiny-N relaxation
-      # legitimately `@warn`s ("Hardly any initial movement…") and GadgetIO
-      # `@info`s per block — neither should surface during precompilation.
+      # Silence logging: the tiny-N relaxation legitimately `@warn`s and
+      # GadgetIO `@info`s per block; neither should surface during precompile.
       with_logger(NullLogger()) do
-        param = Parameters()
-        param.Npart = npart
-        param.Maxiter = 1
-        param.MpsFraction = 5.0
-        param.StepReduction = 0.95
-        param.density_function_correction = 0.0
-        param.LimitMps = (-1.0, -1.0, -1.0, -1.0)
-        param.MoveFractionMin = 0.01
-        param.MoveFractionMax = 0.01
-        param.ProbesFraction = 0.1
-        param.RedistributionFrequency = 5
-        param.LastMoveStep = 256
-        param.Problem_Flag = 0
-        param.Problem_Subflag = 0
+        # One full relaxation for a given kernel at particle count `np`.
+        function _pc_relax(np::Int, kc::KernelConfig)
+            param = Parameters()
+            param.Npart = np
+            param.Maxiter = 1
+            param.MpsFraction = 5.0
+            param.StepReduction = 0.95
+            param.LimitMps = (-1.0, -1.0, -1.0, -1.0)
+            param.MoveFractionMin = 0.01
+            param.MoveFractionMax = 0.01
+            param.ProbesFraction = 0.1
+            param.RedistributionFrequency = 5
+            param.LastMoveStep = 256
+            prob = setup_problem(param)
+            problem = ProblemParameters(; Name = prob.name, Mpart = 1.0 / np,
+                                          Boxsize = prob.boxsize,
+                                          Rho_Max = prob.rho_max,
+                                          Periodic = prob.periodic)
+            particles = Particles(np)
+            make_positions!(particles, param, problem)
+            make_ids!(particles, param)
+            regularise_sph_particles!(particles, param, problem, prob, kc;
+                                      verbose = false, output_diagnostics = false)
+            return particles, param, problem
+        end
 
-        prob = setup_problem(param)
-        problem = ProblemParameters(; Name = prob.name,
-                                      Mpart = 1.0 / npart,   # const-ρ exact
-                                      Boxsize = prob.boxsize,
-                                      Rho_Max = prob.rho_max,
-                                      Periodic = prob.periodic)
+        # Driver default (WC4, DESNNGB 200 → needs N > 200) and cheap Cubic.
+        particles, param, problem = _pc_relax(343, KernelConfig(WendlandC4; dim = 3))
+        _pc_relax(64, KernelConfig(CubicSpline; dim = 3))
 
-        particles = Particles(npart)
-        make_positions!(particles, param, problem)   # 3-arg driver entry
-        make_ids!(particles, param)
-
-        # Whole relaxation call tree (kernel-agnostic in its signature).
-        kc = KernelConfig(CubicSpline; dim = 3)
-        regularise_sph_particles!(particles, param, problem, prob, kc;
-                                  verbose = false,
-                                  output_diagnostics = false)
-
-        # Per-kernel SPHKernels delegation, every supported kernel × dim.
-        for kt in (CubicSpline, WendlandC2, WendlandC4,
-                   WendlandC6, WendlandC8)
+        # Leaf kernel evaluations for every supported kernel × dimension.
+        for kt in (CubicSpline, WendlandC2, WendlandC4, WendlandC6, WendlandC8)
             for d in (2, 3)
                 k = KernelConfig(kt; dim = d)
                 sph_kernel(k, 0.3, 1.0)
                 sph_kernel_deriv(k, 0.3, 1.0)
-                sph_bias_correction(k, 1.0, 1.0 / npart, 1.0)
+                sph_bias_correction(k, 1.0, 1.0 / 343, 1.0)
             end
         end
 
-        # Parameter parser + snapshot writer (no side effects: temp dir).
+        # Parameter parser + snapshot writer (temp dir → no side effects).
         mktempdir() do dir
             tomlfile = joinpath(@__DIR__, "..", "parameters.toml")
             isfile(tomlfile) && read_param_file(tomlfile)

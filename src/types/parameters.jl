@@ -143,8 +143,8 @@ Construct from a built-in kernel via [`KernelConfig(kernel::KernelType; dim=3)`]
 (looks up `DESNNGB`/`NNGBDEV` from the `globals.h` tables) or from any kernel
 instance via [`KernelConfig(kernel::AbstractSPHKernel; desnngb, …)`](@ref).
 """
-struct KernelConfig
-    kernel::AbstractSPHKernel
+struct KernelConfig{K<:AbstractSPHKernel}
+    kernel::K
     dim::Int
     desnngb::Int
     nngbdev::Float64
