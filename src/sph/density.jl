@@ -364,7 +364,7 @@ function _fill_rho_model!(particles::Particles, prob::Problem, n::Int,
 end
 
 # Driver-convenience method: re-derive `prob` and use the default kernel
-# config so the Phase-0/1 `main` pipeline can call this without error once
+# config so the Phase-0/1 `make_sph_wvtics` pipeline can call this without error once
 # Phase 3 wires it in.  The relax stub stays a no-op (Phase 3 owns the loop).
 function find_sph_quantities!(particles::Particles, param::Parameters,
                               problem::ProblemParameters;

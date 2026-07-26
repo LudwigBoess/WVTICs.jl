@@ -17,6 +17,14 @@
 # ===========================================================================
 
 using WVTICs
+# `WVTICs` exports only `make_sph_wvtics`; the distributed pipeline drives the
+# stages individually, so pull the internal entry points in explicitly
+# (`using M: name` resolves unexported names).
+using WVTICs: init_workers, read_param_file, setup, setup_problem,
+       make_positions!, make_ids!, make_velocities!, make_temperatures!,
+       make_magnetic_fields!, make_post_processing!,
+       regularise_sph_particles_distributed!, decompose_domain,
+       write_output_distributed
 using Distributed
 
 const PARFILE = length(ARGS) >= 1 ? ARGS[1] : "ics.par"
@@ -36,6 +44,11 @@ try
     # Make the package available on every worker (message-passing only;
     # no shared address space assumed).
     @everywhere using WVTICs
+    @everywhere using WVTICs: read_param_file, setup, setup_problem,
+        make_positions!, make_ids!, make_velocities!, make_temperatures!,
+        make_magnetic_fields!, make_post_processing!,
+        regularise_sph_particles_distributed!, decompose_domain,
+        write_output_distributed
 
     # 2. Standard pipeline, but the relaxation goes through the DISTRIBUTED
     #    driver (Peano decomposition + 2·max(hsml) halo + global reductions;

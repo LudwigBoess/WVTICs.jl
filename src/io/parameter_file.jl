@@ -30,7 +30,11 @@
 #     MoveFractionMin, MoveFractionMax, ProbesFraction,
 #     RedistributionFrequency, LastMoveStep, density_function_correction
 #     (legacy alias `BiasCorrection` still accepted),
-#     Problem_Flag, Problem_Subflag
+#     Problem_Flag, Problem_Subflag, DesNumNgb
+#
+#   `DesNumNgb` is a Julia-port extension (no C analogue) setting the target SPH
+#   neighbour count (`DESNNGB`); it is OPTIONAL in both the ASCII and TOML paths
+#   and defaults to 0 (= use the selected kernel's built-in default).
 #
 #   REQUIRED keys (error if absent, mirroring the ASCII "missing tag" error):
 #     Npart, Maxiter, Problem_Flag, Problem_Subflag.
@@ -90,7 +94,8 @@ top-level table whose keys are the same tags as the ASCII format:
 `LimitMps10`, `LimitMps100`, `LimitMps1000`, `MoveFractionMin`,
 `MoveFractionMax`, `ProbesFraction`, `RedistributionFrequency`,
 `LastMoveStep`, `density_function_correction` (legacy alias `BiasCorrection`
-still accepted), `Problem_Flag`, `Problem_Subflag`.
+still accepted), `Problem_Flag`, `Problem_Subflag`, `DesNumNgb` (Julia-port
+extension: target SPH neighbour count `DESNNGB`, optional, defaults to 0).
 
 `Npart`, `Maxiter`, `Problem_Flag` and `Problem_Subflag` are **required**;
 every other key is optional and defaults to the `Parameters()` default
@@ -168,7 +173,14 @@ const _PARAM_TAGS = Tuple{String,Symbol,Symbol}[
     ("density_function_correction", :density_function_correction, :real),
     ("Problem_Flag",            :Problem_Flag,            :int),
     ("Problem_Subflag",         :Problem_Subflag,         :int),
+    ("DesNumNgb",               :DesNumNgb,               :int),
 ]
+
+# Optional parameter tags (Julia-port extensions with no C analogue): parsed if
+# present but NOT required — unlike every C tag, each of which must appear in an
+# ASCII file. `DesNumNgb` sets the target SPH neighbour count (`DESNNGB`) and
+# overrides the kernel's default when > 0; omitting it keeps the kernel default.
+const _PARAM_OPTIONAL_TAGS = ("DesNumNgb",)
 
 # Back-compatible legacy parameter-file tag aliases. The C reference parameter
 # file (`/e/ocean2/users/lboess/WVTICs/ics.par`) and all existing `.par`/`.toml`
@@ -231,7 +243,11 @@ function _read_param_ascii(filename::AbstractString)
 
     param = Parameters()
     limits = zeros(Float64, 4)
-    done = Dict{String,Bool}(t[1] => false for t in _PARAM_TAGS)
+    # Only the C tags are required; the Julia-port optional tags
+    # (`_PARAM_OPTIONAL_TAGS`, e.g. `DesNumNgb`) are omitted from the
+    # must-be-present set so existing `.par` files keep parsing.
+    done = Dict{String,Bool}(t[1] => false for t in _PARAM_TAGS
+                             if !(t[1] in _PARAM_OPTIONAL_TAGS))
 
     for raw in eachline(filename)
         tokens = split(raw)                       # whitespace split, drops empties

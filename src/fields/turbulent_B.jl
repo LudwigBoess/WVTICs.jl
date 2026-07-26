@@ -4,7 +4,7 @@
 # is standalone (flat-binary interchange); this port is in-memory and callable
 # both standalone and as a problem `postprocess!` hook for the cluster /
 # Magneticum problems (the preferred wiring per CLAUDE.md §1.9 — it needs ALL
-# final post-relaxation positions, and `main` runs the appliers after
+# final post-relaxation positions, and `make_sph_wvtics` runs the appliers after
 # `regularise_sph_particles!`).
 #
 # Algorithm (C `make_magnetic_field`):
@@ -345,7 +345,7 @@ nothing` that fills `particles.bfld` with a divergence-free turbulent field
 ([`make_turbulent_Bfield`](@ref)) over the final post-relaxation positions.
 
 Wired into the **galaxy_cluster (4.12)** and **magneticum (2.0)** problems
-(CLAUDE.md §1.9): `main` calls `make_post_processing!` after
+(CLAUDE.md §1.9): `make_sph_wvtics` calls `make_post_processing!` after
 `regularise_sph_particles!`, so all particle positions are final when this
 runs. `B_scale` defaults to `boxsize/16` (a reasonable turbulent injection
 scale that keeps the grid modest); pass it explicitly to override. The box is

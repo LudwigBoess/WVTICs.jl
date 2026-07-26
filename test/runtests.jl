@@ -1,4 +1,18 @@
 using WVTICs
+# `WVTICs` now exports only `make_sph_wvtics`; every other symbol the test
+# suite exercises is internal and pulled in explicitly (`using M: name`
+# works for unexported names).
+using WVTICs: make_sph_wvtics, Parameters, ProblemParameters, KernelConfig,
+       KernelType, CubicSpline, WendlandC2, WendlandC4, WendlandC6, WendlandC8,
+       WendlandC10, WendlandC12, default_kernel_config, Particles,
+       read_param_file, read_param_toml, regularise_sph_particles!,
+       regularise_sph_particles_distributed!, init_workers, plan_workers,
+       detect_scheduler, scheduler_pool_size, decompose_domain, Decomposition,
+       peano_keys, select_ghosts, distributed_iteration_reductions,
+       write_output_distributed, setup, setup_problem, Problem,
+       PROBLEM_REGISTRY, make_positions!, make_ids!, make_velocities!,
+       make_temperatures!, make_magnetic_fields!, make_post_processing!,
+       make_turbulent_Bfield, make_turbulent_postprocess, write_output
 using Test
 using StaticArrays
 using GadgetIO
@@ -86,6 +100,136 @@ const ICS_PAR = "/e/ocean2/users/lboess/WVTICs/ics.par"
         @test_throws ArgumentError KernelConfig(WendlandC4; dim = 1)
     end
 
+    @testset "KernelConfig from AbstractSPHKernel instance" begin
+        SK = WVTICs.SPHKernels
+
+        # Build directly from a kernel instance; desnngb required, dim/ngbmax/
+        # nngbdev defaulted from the instance and the usual conventions.
+        kc = KernelConfig(SK.WendlandC4(Float64, 3); desnngb = 200)
+        @test kc.kernel isa SK.WendlandC4
+        @test kc.dim == 3               # taken from the instance
+        @test kc.desnngb == 200
+        @test kc.nngbdev == 0.05        # default
+        @test kc.ngbmax == 200 * 8      # default desnngb*8
+
+        # The stored instance is used directly on the hot path: an instance-built
+        # WC4 config must give byte-identical kernel values / derivatives / bias
+        # to the enum-built one (same underlying SPHKernels object).
+        enum_kc = KernelConfig(WendlandC4; dim = 3)
+        for r in (0.0, 0.2, 0.5, 0.8, 0.99)
+            @test WVTICs.sph_kernel(kc, r, 1.0) == WVTICs.sph_kernel(enum_kc, r, 1.0)
+            @test WVTICs.sph_kernel_deriv(kc, r, 1.0) ==
+                  WVTICs.sph_kernel_deriv(enum_kc, r, 1.0)
+        end
+        @test WVTICs.sph_bias_correction(kc, 1.0, 0.01, 1.0) ==
+              WVTICs.sph_bias_correction(enum_kc, 1.0, 0.01, 1.0)
+
+        # Explicit dim / nngbdev / ngbmax overrides.
+        kc2 = KernelConfig(SK.WendlandC6(Float64, 2); dim = 2, desnngb = 44,
+                           nngbdev = 0.01, ngbmax = 100)
+        @test kc2.kernel isa SK.WendlandC6
+        @test kc2.dim == 2
+        @test (kc2.desnngb, kc2.nngbdev, kc2.ngbmax) == (44, 0.01, 100)
+
+        # A future / non-built-in kernel (Quintic is in SPHKernels but has no
+        # WVTICs enum entry) also works with no code change.
+        kq = KernelConfig(SK.Quintic(Float64, 3); desnngb = 100)
+        @test kq.kernel isa SK.Quintic
+        @test WVTICs.sph_kernel(kq, 0.3, 1.0) ==
+              SK.kernel_value(SK.Quintic(Float64, 3), 0.3, 1.0)
+
+        # `desnngb` is required (no default).
+        @test_throws UndefKeywordError KernelConfig(SK.WendlandC4(Float64, 3))
+        # dim must be 2 or 3.
+        @test_throws ArgumentError KernelConfig(SK.WendlandC4(Float64, 3);
+                                                dim = 1, desnngb = 10)
+    end
+
+    @testset "with_desnngb + DesNumNgb parameter override" begin
+        SK = WVTICs.SPHKernels
+
+        # with_desnngb rescales ngbmax (*8 non-cubic, *16 cubic), keeps kernel.
+        wc4 = KernelConfig(WendlandC4; dim = 3)
+        o = WVTICs.with_desnngb(wc4, 150)
+        @test o.kernel === wc4.kernel
+        @test o.desnngb == 150
+        @test o.ngbmax == 150 * 8
+        @test o.nngbdev == wc4.nngbdev
+        @test o.dim == wc4.dim
+
+        cub = KernelConfig(CubicSpline; dim = 3)
+        @test WVTICs.with_desnngb(cub, 60).ngbmax == 60 * 16
+
+        # DesNumNgb parses (optional) in both ASCII and TOML, defaults to 0.
+        mktempdir() do dir
+            # TOML: present.
+            ptoml = joinpath(dir, "p.toml")
+            write(ptoml, """
+                Npart = 100
+                Maxiter = 1
+                Problem_Flag = 0
+                Problem_Subflag = 0
+                DesNumNgb = 123
+                """)
+            @test read_param_file(ptoml).DesNumNgb == 123
+
+            # TOML: absent -> default 0.
+            ptoml0 = joinpath(dir, "p0.toml")
+            write(ptoml0, """
+                Npart = 100
+                Maxiter = 1
+                Problem_Flag = 0
+                Problem_Subflag = 0
+                """)
+            @test read_param_file(ptoml0).DesNumNgb == 0
+
+            # ASCII: present.
+            ppar = joinpath(dir, "p.par")
+            write(ppar, """
+                Npart 100
+                Maxiter 1
+                MpsFraction 5.0
+                StepReduction 0.95
+                LimitMps -1.0
+                LimitMps10 -1.0
+                LimitMps100 -1.0
+                LimitMps1000 1.0
+                MoveFractionMin 0.01
+                MoveFractionMax 0.01
+                ProbesFraction 0.1
+                RedistributionFrequency 5
+                LastMoveStep 10
+                density_function_correction 0.0
+                Problem_Flag 0
+                Problem_Subflag 0
+                DesNumNgb 77
+                """)
+            @test read_param_file(ppar).DesNumNgb == 77
+
+            # ASCII: DesNumNgb absent -> optional, still parses, default 0.
+            ppar0 = joinpath(dir, "p0.par")
+            write(ppar0, """
+                Npart 100
+                Maxiter 1
+                MpsFraction 5.0
+                StepReduction 0.95
+                LimitMps -1.0
+                LimitMps10 -1.0
+                LimitMps100 -1.0
+                LimitMps1000 1.0
+                MoveFractionMin 0.01
+                MoveFractionMax 0.01
+                ProbesFraction 0.1
+                RedistributionFrequency 5
+                LastMoveStep 10
+                density_function_correction 0.0
+                Problem_Flag 0
+                Problem_Subflag 0
+                """)
+            @test read_param_file(ppar0).DesNumNgb == 0
+        end
+    end
+
     @testset "Particles SoA container" begin
         n = 11
         ps = Particles(n)
@@ -135,7 +279,7 @@ const ICS_PAR = "/e/ocean2/users/lboess/WVTICs/ics.par"
             par = joinpath(dir, "ics_small.par")
             write(par, cfg)
             cd(dir) do
-                ps = main(par; verbose = false)
+                ps = make_sph_wvtics(par; verbose = false)
                 @test ps isa Particles
                 @test length(ps) == 2000
                 @test isfile(joinpath(dir, "IC_Constant_Density"))
@@ -1072,7 +1216,7 @@ end
         # (~seconds) is expected.
         mktempdir() do dir
             cd(dir) do
-                ps = main(PARAMS_TOML; verbose = false)
+                ps = make_sph_wvtics(PARAMS_TOML; verbose = false)
                 @test ps isa Particles
                 @test length(ps) == 2000
                 @test isfile(joinpath(dir, "IC_Constant_Density"))
@@ -1565,7 +1709,7 @@ end
             pf = joinpath(dir, "ot.par")
             write(pf, cfg)
             cd(dir) do
-                ps = main(pf; verbose = false)
+                ps = make_sph_wvtics(pf; verbose = false)
                 @test ps isa Particles
                 @test length(ps) == 1500
                 @test isfile(joinpath(dir, "IC_Orszag_Tang"))

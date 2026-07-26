@@ -28,7 +28,7 @@ the default (`POS,VEL,ID,RHO,RHOM,HSML,U,BFLD`). `REDI` is appended iff
 `output_diagnostics` (C `OUTPUT_DIAGNOSTICS`, default on).
 """
 function snapshot_block_order(kcfg::KernelConfig; output_diagnostics::Bool = true)
-    order = if kcfg.kernel === CubicSpline
+    order = if kcfg.kernel isa SPHKernels.Cubic
         Symbol[:POS, :VEL, :ID, :U, :RHO, :HSML, :BFLD, :RHOM]
     else
         Symbol[:POS, :VEL, :ID, :RHO, :RHOM, :HSML, :U, :BFLD]

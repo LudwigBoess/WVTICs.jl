@@ -59,6 +59,14 @@ LastMoveStep            = 10
 #     is still accepted by the loader for back-compatibility. ---
 density_function_correction = 0.0
 
+# --- SPH kernel neighbour count (Julia-port extension) ---
+# DesNumNgb sets the target/desired SPH neighbour count (DESNNGB). OPTIONAL:
+# omit it or set 0 to use the selected kernel's built-in default (e.g. 200 for
+# Wendland C4 in 3D). A positive value overrides DESNNGB for whatever kernel is
+# passed to `make_sph_wvtics` — needed when using a kernel with no built-in
+# neighbour-count table.
+DesNumNgb = 0
+
 # --- Problem selection ---
 # 0 - Simple periodic tests
 #   0 - Constant Density   <-- this file

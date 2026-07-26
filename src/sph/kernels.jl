@@ -56,10 +56,24 @@
 #     WC6  : ρ − 0.0116 ·(n·0.01)^-2.236 · m · (1365/64π · h⁻³)
 #            (only if that δρ < 0.2·ρ — SPHKernels' WC6 clamp)
 #
-#   For dim≠3 SPHKernels uses the matching DESNNGB and the 2D/1D `kernel_norm`
-#   power (`h⁻²`/`h⁻¹`); SPHKernels applies no 2D-vs-3D special-casing, so
-#   neither does this adapter (it forwards `kc.dim`).  This differs from the
-#   retired C-faithful path, which forced 2D bias = 0.
+#   SPHKernels itself applies no 2D-vs-3D special-casing on the bias term.
+#   This adapter, however, **gates the correction to `dim == 3`** (returns
+#   ρ unchanged for `dim != 3`) — the C-faithful behaviour: each C
+#   `kernel.c::bias_correction_WC{2,4,6}` opens with
+#   `#ifdef TWO_DIM return 0.0;`, so the self-bias term is a 3D-only
+#   correction (the Dehnen&Aly coefficients are fitted to the 3D relation
+#   and have no valid 2D analogue).  Forwarding the 3D-fitted term into a
+#   2D run (3D coefficients × the 2D `kernel_norm` `norm·h⁻²` × the 2D
+#   DESNNGB) injects a spurious, h-dependent density bias that the WVT
+#   relaxation — whose entire 2D tuning assumes the *unbiased* raw 2D
+#   estimator (C `bias = 0`) — cannot anneal away: the 2D-specific
+#   density-normalisation defect behind the "2D constant-density
+#   convergence QUALITY" open issue.  Restoring the C 2D=0 gate makes the
+#   2D density path C-byte-faithful while leaving 3D byte-identical (the
+#   `dim == 3` arm and its SPHKernels call are unchanged).  This supersedes
+#   the earlier "intentional divergence: 2D applies the correction" note —
+#   that divergence was the unfixed-quality root cause; the WC4-sign /
+#   WC4→WC2-norm / Δ-vs-corrected-ρ / WC6-clamp 3D rationale is unchanged.
 #
 # §4b: `h_inv` is computed once per particle by the caller and threaded
 # through; the per-neighbour kernel calls take `(u, h_inv)` and pass `u` and
@@ -68,37 +82,16 @@
 # recompute `h_inv` internally).
 
 """
-    sph_kernel_type(kc::KernelConfig)
-
-Map a [`KernelConfig`](@ref) to the corresponding `SPHKernels.jl` kernel
-*instance* with the correct dimension.  This is the single source of the
-project-`KernelType` → SPHKernels mapping, reused on the hot path by
-[`sph_kernel`](@ref) / [`sph_kernel_deriv`](@ref) and available to external
-callers wanting the library object.
-
-Restricted to Cubic / WC2 / WC4 / WC6 / WC8 (C10/C12 are out of scope and
-already rejected by `KernelConfig`).
-"""
-function sph_kernel_type(kc::KernelConfig)
-    d = kc.dim
-    k = kc.kernel
-    k === CubicSpline && return SPHKernels.Cubic(Float64, d)
-    k === WendlandC2  && return SPHKernels.WendlandC2(Float64, d)
-    k === WendlandC4  && return SPHKernels.WendlandC4(Float64, d)
-    k === WendlandC6  && return SPHKernels.WendlandC6(Float64, d)
-    k === WendlandC8  && return SPHKernels.WendlandC8(Float64, d)
-    throw(ArgumentError("kernel $(kc.kernel) is unsupported in this port " *
-                        "(CLAUDE.md §1.6/§5)"))
-end
-
-"""
     sph_kernel(kc::KernelConfig, r, h_inv) -> Float64
 
-SPH kernel value `W(r,h)` for the configured kernel, evaluated via
-`SPHKernels.kernel_value`.  `h_inv = 1/h` is supplied by the caller (computed
-once per particle, §4b); `r` is the (already minimum-image–corrected) pair
-distance.  `u = r·h_inv` and `h_inv` are passed straight to SPHKernels (no
-per-call `1/h`).  Returns 0 for `r ≥ h`.
+SPH kernel value `W(r,h)` for the configured kernel, evaluated **directly via
+`SPHKernels.kernel_value`** on the stored `kc.kernel` instance (the project no
+longer re-implements the kernel polynomials or their dispatch, and no longer
+re-allocates a kernel object per call — the instance is built once at
+[`KernelConfig`](@ref) construction and reused here).  `h_inv = 1/h` is supplied
+by the caller (computed once per particle, §4b); `r` is the (already
+minimum-image–corrected) pair distance.  `u = r·h_inv` and `h_inv` are passed
+straight to SPHKernels (no per-call `1/h`).  Returns 0 for `r ≥ h`.
 
 Normalisation/sign match `kernel.c::sph_kernel_*` exactly:
 `SPHKernels.kernel_value(k,u,h⁻¹) = norm·h⁻¹^dim·P(u)`.
@@ -106,31 +99,18 @@ Normalisation/sign match `kernel.c::sph_kernel_*` exactly:
 @inline function sph_kernel(kc::KernelConfig, r::Real, h_inv::Real)
     hi = Float64(h_inv)
     u = Float64(r) * hi
-    k = kc.kernel
-    d = kc.dim
-    # Branch on KernelType so each arm is type-stable (concrete kernel struct,
-    # `Float64` return); union-splitting is contained here, off the call path.
-    if k === CubicSpline
-        return SPHKernels.kernel_value(SPHKernels.Cubic(Float64, d), u, hi)
-    elseif k === WendlandC2
-        return SPHKernels.kernel_value(SPHKernels.WendlandC2(Float64, d), u, hi)
-    elseif k === WendlandC4
-        return SPHKernels.kernel_value(SPHKernels.WendlandC4(Float64, d), u, hi)
-    elseif k === WendlandC6
-        return SPHKernels.kernel_value(SPHKernels.WendlandC6(Float64, d), u, hi)
-    elseif k === WendlandC8
-        return SPHKernels.kernel_value(SPHKernels.WendlandC8(Float64, d), u, hi)
-    end
-    throw(ArgumentError("unsupported kernel $(kc.kernel)"))
+    return SPHKernels.kernel_value(kc.kernel, u, hi)
 end
 
 """
     sph_kernel_deriv(kc::KernelConfig, r, h_inv) -> Float64
 
 SPH kernel derivative `dW/dr (r,h)` for the configured kernel
-(`sph_kernel_derivative` in `kernel.c`), evaluated via
-`SPHKernels.kernel_deriv`.  `h_inv = 1/h` supplied by the caller (§4b);
-`u = r·h_inv` and `h_inv` are passed straight through (no per-call `1/h`).
+(`sph_kernel_derivative` in `kernel.c`), evaluated **directly via
+`SPHKernels.kernel_deriv`** on the stored `kc.kernel` instance — no
+re-defined polynomial / dispatch and no per-call re-allocation.  `h_inv = 1/h`
+supplied by the caller (§4b); `u = r·h_inv` and `h_inv` are passed straight
+through (no per-call `1/h`).
 
 `SPHKernels.kernel_deriv(k,u,h⁻¹) = h⁻¹·norm·h⁻¹^dim·P'(u)`, with `P'` negative
 on (0,1) — same sign as `kernel.c::sph_kernel_derivative_*` — so this matches
@@ -140,20 +120,7 @@ on (0,1) — same sign as `kernel.c::sph_kernel_derivative_*` — so this matche
 @inline function sph_kernel_deriv(kc::KernelConfig, r::Real, h_inv::Real)
     hi = Float64(h_inv)
     u = Float64(r) * hi
-    k = kc.kernel
-    d = kc.dim
-    if k === CubicSpline
-        return SPHKernels.kernel_deriv(SPHKernels.Cubic(Float64, d), u, hi)
-    elseif k === WendlandC2
-        return SPHKernels.kernel_deriv(SPHKernels.WendlandC2(Float64, d), u, hi)
-    elseif k === WendlandC4
-        return SPHKernels.kernel_deriv(SPHKernels.WendlandC4(Float64, d), u, hi)
-    elseif k === WendlandC6
-        return SPHKernels.kernel_deriv(SPHKernels.WendlandC6(Float64, d), u, hi)
-    elseif k === WendlandC8
-        return SPHKernels.kernel_deriv(SPHKernels.WendlandC8(Float64, d), u, hi)
-    end
-    throw(ArgumentError("unsupported kernel $(kc.kernel)"))
+    return SPHKernels.kernel_deriv(kc.kernel, u, hi)
 end
 
 """
@@ -179,13 +146,22 @@ and lacks SPHKernels' WC6 `<0.2ρ` clamp).  See PORT_STATUS.md
     that term `< 0.2·ρ`; SPHKernels' WC6 clamp)
 
 `n = kc.desnngb` (DESNNGB, the desired neighbour count); `𝒩_X(h⁻¹) =
-norm_X · h⁻¹^dim` is `SPHKernels.kernel_norm` (so the `dim`-dependent power
-is handled by SPHKernels — for `dim≠3` the matching DESNNGB and 2D/1D norm
-are used; SPHKernels itself applies no 2D/3D guard).  `Float64` return.
+norm_X · h⁻¹^dim` is `SPHKernels.kernel_norm`.  `Float64` return.
 
-The `if k === …` chain is union-split on the `KernelType` enum so each arm
-binds a concrete SPHKernels kernel struct (no boxed captures / dynamic
-dispatch on the hot path), mirroring [`sph_kernel`](@ref).
+**Dimension gate (C-faithful, the 2D-quality fix):** the correction is
+applied **only for `dim == 3`**.  For `dim != 3` `ρ` is returned
+**unchanged** — matching the C `kernel.c::bias_correction_WC{2,4,6}`,
+each of which begins `#ifdef TWO_DIM return 0.0;` (the Dehnen&Aly
+coefficients are fitted to the 3D self-bias relation and have no valid
+2D analogue; the C author hard-codes the 2D term to zero).  This closes
+the only C-vs-Julia divergence in the 2D density path — see the inline
+comment on the `if d != 3` guard and PORT_STATUS.md's
+"2D constant-density convergence QUALITY" issue.  3D is byte-identical
+(the `dim == 3` SPHKernels call is unchanged).
+
+The kernel object is the stored `kc.kernel` instance and the correction itself
+is `SPHKernels.bias_correction` — the project does not re-implement the
+Dehnen&Aly term (mirroring [`sph_kernel`](@ref) / [`sph_kernel_deriv`](@ref)).
 """
 @inline function sph_bias_correction(kc::KernelConfig, density::Real,
                                      mpart::Real, h_inv::Real)
@@ -194,22 +170,38 @@ dispatch on the hot path), mirroring [`sph_kernel`](@ref).
     m = Float64(mpart)
     n = kc.desnngb                                            # DESNNGB
     d = kc.dim
-    k = kc.kernel
-    if k === CubicSpline
-        return SPHKernels.bias_correction(SPHKernels.Cubic(Float64, d),
-                                          rho, m, hi, n)
-    elseif k === WendlandC2
-        return SPHKernels.bias_correction(SPHKernels.WendlandC2(Float64, d),
-                                          rho, m, hi, n)
-    elseif k === WendlandC4
-        return SPHKernels.bias_correction(SPHKernels.WendlandC4(Float64, d),
-                                          rho, m, hi, n)
-    elseif k === WendlandC6
-        return SPHKernels.bias_correction(SPHKernels.WendlandC6(Float64, d),
-                                          rho, m, hi, n)
-    elseif k === WendlandC8
-        return SPHKernels.bias_correction(SPHKernels.WendlandC8(Float64, d),
-                                          rho, m, hi, n)
+    # ── 2D/1D: NO kernel self-bias correction (C-faithful) ───────────────
+    # The C `kernel.c::bias_correction_WC{2,4,6}` each open with
+    # `#ifdef TWO_DIM return 0.0;` — i.e. the self-bias term is applied
+    # **only in 3D**; in a `TWO_DIM` build the correction is identically
+    # zero (and `bias_correction` for Cubic/WC8 is `0.0` in every
+    # dimension).  The Dehnen&Aly / Cullen&Dehnen coefficients
+    # (`0.01342`, exponent `-1.579`, …) are fitted for the *3D* SPH
+    # self-bias relation and have NO valid 2D analogue — which is exactly
+    # why the C author hard-codes the 2D term to zero.  `SPHKernels`
+    # itself applies no 2D/3D guard, so it would (incorrectly for this
+    # port's purpose) evaluate that 3D-fitted term with the 2D
+    # `kernel_norm` (`norm·h⁻²`) and the 2D DESNNGB, injecting a spurious
+    # density bias the WVT relaxation (whose entire 2D tuning — `d_mps`,
+    # model-hsml, step annealing — assumes the *unbiased* raw 2D
+    # estimator, C `bias=0`) cannot anneal away: a 2D-specific
+    # density-normalisation defect, the documented "2D constant-density
+    # convergence QUALITY" open issue.  Gate the correction to `dim == 3`
+    # so the 2D density path is C-byte-faithful (raw estimator, no
+    # correction).  This is the SINGLE C-vs-Julia divergence remaining in
+    # the entire 2D density/kernel path (every other 2D constant/exponent
+    # — kernel norms `1/h²`, `wkNgb = π·wk·h²`, `ρ = m·wk`, model-hsml
+    # `√(WVTNNGB·m/ρ/π)`, `norm_hsml`, `d_mps`, `npart_1D = N^(1/2)` — was
+    # audited byte-identical to the C `#ifdef TWO_DIM` branches).
+    #
+    # 3D path is **byte-identical**: `d == 3` falls straight through to
+    # the `SPHKernels.bias_correction` call below on the stored `kc.kernel`
+    # instance (same SPHKernels call, same args, same result — 3D
+    # constant-density still converges to errMean ≈ 5.4e-4 / ×345).  The
+    # dimension guard is type-stable (`d::Int` compared to a literal;
+    # returns the already-`Float64` `rho`).
+    if d != 3
+        return rho
     end
-    throw(ArgumentError("unsupported kernel $(kc.kernel)"))
+    return SPHKernels.bias_correction(kc.kernel, rho, m, hi, n)
 end

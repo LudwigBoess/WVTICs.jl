@@ -34,6 +34,12 @@ Field meanings (from `globals.h` comments):
 - `LastMoveStep`            : last iteration at which redistribution runs
 - `Problem_Flag`            : problem family selector
 - `Problem_Subflag`         : problem sub-selector
+- `DesNumNgb`               : target/desired SPH neighbour count (`DESNNGB`);
+                              Julia-port extension (no C analogue). `0` means
+                              "use the selected kernel's built-in default"; a
+                              positive value overrides `DESNNGB` for whatever
+                              kernel is passed to [`make_sph_wvtics`](@ref) —
+                              required for kernels with no built-in table.
 """
 Base.@kwdef mutable struct Parameters
     Npart::Int = 0
@@ -49,6 +55,7 @@ Base.@kwdef mutable struct Parameters
     LastMoveStep::Int = 0
     Problem_Flag::Int = 0
     Problem_Subflag::Int = 0
+    DesNumNgb::Int = 0
 end
 
 """
@@ -122,28 +129,59 @@ Runtime replacement for the C compile-time `DESNNGB`/`NNGBDEV`/`NGBMAX`
 macros (`globals.h`, CLAUDE.md §1.6).
 
 Fields:
-- `kernel`  : selected [`KernelType`]
+- `kernel`  : the `SPHKernels.jl` kernel **instance** (any `AbstractSPHKernel`
+              subtype) used directly on the hot path — value / derivative /
+              self-bias all dispatch on this object, so kernels beyond the
+              built-in Cubic/WC2/WC4/WC6/WC8 set (present or future SPHKernels
+              additions) work without any change to WVTICs
 - `dim`     : 2 or 3 (replaces the `TWO_DIM` compile flag)
 - `desnngb` : SPH kernel-weighted desired neighbour count (`DESNNGB`)
 - `nngbdev` : tolerance on the kernel-weighted neighbour count (`NNGBDEV`)
 - `ngbmax`  : neighbour list cap (`NGBMAX`)
 
-Construct via [`KernelConfig(kernel; dim=3)`](@ref).
+Construct from a built-in kernel via [`KernelConfig(kernel::KernelType; dim=3)`](@ref)
+(looks up `DESNNGB`/`NNGBDEV` from the `globals.h` tables) or from any kernel
+instance via [`KernelConfig(kernel::AbstractSPHKernel; desnngb, …)`](@ref).
 """
 struct KernelConfig
-    kernel::KernelType
+    kernel::AbstractSPHKernel
     dim::Int
     desnngb::Int
     nngbdev::Float64
     ngbmax::Int
 end
 
+# Map the project `KernelType` enum + dimension to the concrete `SPHKernels.jl`
+# kernel instance. Called ONCE at `KernelConfig` construction (the instance is
+# then stored in the config and reused on the hot path) — NOT per kernel
+# evaluation. Restricted to Cubic / WC2 / WC4 / WC6 / WC8 (WC10/WC12 are
+# rejected by the enum constructor before this is reached).
+function _kernel_instance(k::KernelType, dim::Integer)
+    k === CubicSpline && return SPHKernels.Cubic(Float64, dim)
+    k === WendlandC2  && return SPHKernels.WendlandC2(Float64, dim)
+    k === WendlandC4  && return SPHKernels.WendlandC4(Float64, dim)
+    k === WendlandC6  && return SPHKernels.WendlandC6(Float64, dim)
+    k === WendlandC8  && return SPHKernels.WendlandC8(Float64, dim)
+    throw(ArgumentError("kernel $k is unsupported in this port."))
+end
+
+# Dimension carried by an SPHKernels instance (all supported kernels store an
+# `Int8 dim`). Kernels without a `dim` field (e.g. Tophat) require `dim` to be
+# passed explicitly to `KernelConfig`.
+function _kernel_dim(kernel::AbstractSPHKernel)
+    hasproperty(kernel, :dim) ||
+        throw(ArgumentError("kernel $(typeof(kernel)) has no `dim` field; " *
+                            "pass `dim` explicitly to KernelConfig"))
+    return Int(getproperty(kernel, :dim))
+end
+
 """
     KernelConfig(kernel::KernelType; dim::Integer = 3)
 
-Build a [`KernelConfig`](@ref), looking up `DESNNGB`/`NNGBDEV` from the
-kernel+dimension tables transcribed from `globals.h`. `NGBMAX` is
-`DESNNGB * 16` for the cubic spline and `DESNNGB * 8` otherwise.
+Build a [`KernelConfig`](@ref) from a built-in [`KernelType`](@ref), looking up
+`DESNNGB`/`NNGBDEV` from the kernel+dimension tables transcribed from
+`globals.h`. `NGBMAX` is `DESNNGB * 16` for the cubic spline and `DESNNGB * 8`
+otherwise. The matching `SPHKernels.jl` instance is built once and stored.
 
 Throws for `WendlandC10`/`WendlandC12` (not available in `SPHKernels.jl`)
 and for `dim` ∉ (2, 3).
@@ -157,7 +195,46 @@ function KernelConfig(kernel::KernelType; dim::Integer = 3)
     table = dim == 3 ? _KERNEL_TABLE_3D : _KERNEL_TABLE_2D
     desnngb, nngbdev = table[kernel]
     ngbmax = kernel === CubicSpline ? desnngb * 16 : desnngb * 8
-    return KernelConfig(kernel, Int(dim), desnngb, nngbdev, ngbmax)
+    return KernelConfig(_kernel_instance(kernel, dim), Int(dim),
+                        desnngb, nngbdev, ngbmax)
+end
+
+"""
+    KernelConfig(kernel::AbstractSPHKernel; dim = kernel.dim, desnngb,
+                 nngbdev = 0.05, ngbmax = desnngb * 8)
+
+Build a [`KernelConfig`](@ref) directly from any `SPHKernels.jl` kernel
+*instance* — so kernels beyond the built-in Cubic/WC2/WC4/WC6/WC8 set (any
+present or future `AbstractSPHKernel` subtype) work with WVTICs without a code
+change. The instance is stored as-is and evaluated directly on the hot path
+(no per-call re-allocation).
+
+`desnngb` (the target/desired SPH neighbour count, C `DESNNGB`) is **required**:
+there is no built-in `DESNNGB` table for arbitrary kernels. `nngbdev` (the
+neighbour-count tolerance) and `ngbmax` (the neighbour-list cap) default to the
+usual `0.05` / `desnngb * 8`. `dim` defaults to the instance's own dimension and
+must be 2 or 3.
+"""
+function KernelConfig(kernel::AbstractSPHKernel;
+                      dim::Integer = _kernel_dim(kernel),
+                      desnngb::Integer,
+                      nngbdev::Real = 0.05,
+                      ngbmax::Integer = desnngb * 8)
+    dim in (2, 3) || throw(ArgumentError("dim must be 2 or 3, got $dim"))
+    return KernelConfig(kernel, Int(dim), Int(desnngb),
+                        Float64(nngbdev), Int(ngbmax))
+end
+
+"""
+    with_desnngb(kc::KernelConfig, desnngb::Integer) -> KernelConfig
+
+Return a copy of `kc` with the target neighbour count (`DESNNGB`) replaced by
+`desnngb`, rescaling `NGBMAX` accordingly (`* 16` for the cubic spline, `* 8`
+otherwise). Used to apply the parameter-file `DesNumNgb` override.
+"""
+function with_desnngb(kc::KernelConfig, desnngb::Integer)
+    ngbmax = kc.kernel isa SPHKernels.Cubic ? desnngb * 16 : desnngb * 8
+    return KernelConfig(kc.kernel, kc.dim, Int(desnngb), kc.nngbdev, ngbmax)
 end
 
 """

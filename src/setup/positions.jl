@@ -145,7 +145,7 @@ end
     return nothing
 end
 
-# Backwards/looser-arity entry point: the Phase-0 `main` driver calls
+# Backwards/looser-arity entry point: the `make_sph_wvtics` driver calls
 # `make_positions!(particles, param, problem)`. Resolve the problem callbacks
 # from the registry so the driver does not need to thread `prob` through.
 function make_positions!(particles::Particles, param::Parameters,
