@@ -828,7 +828,6 @@ function _subset_particles(p::Particles, gids::Vector{Int})
         s.id[k] = p.id[g]
         s.type[k] = p.type[g]
         s.key[k] = p.key[g]
-        s.tree_parent[k] = p.tree_parent[g]
         s.redistributed[k] = p.redistributed[g]
         s.u[k] = p.u[g]
         s.rho[k] = p.rho[g]

@@ -106,8 +106,8 @@ end
 
 # tophat.c: #define DENSITY_STEP 0.5, RHO_MEAN 1.0
 @inline function _tophat_density(particles::Particles, ipart::Int, density_function_correction)::Float64
-    x = particles.pos[ipart][1] / 1.0   # / Problem.Boxsize[0] (= 1)
-    halfstep = 0.5 * 1.0
+    x = particles.pos[ipart][1]
+    halfstep = 0.5
     rho_max = 1.0 + halfstep
     rho_min = 1.0 - halfstep
     if x <= 0.1 || x > 0.9
@@ -147,11 +147,11 @@ end
 # --- Problem 0.2 : Sawtooth density (problems/sawtooth.c) ------------------
 
 @inline function _sawtooth_density(particles::Particles, ipart::Int, density_function_correction)::Float64
-    x = particles.pos[ipart][1] / 1.0   # / Problem.Boxsize[0] (= 1)
+    x = particles.pos[ipart][1]
     if x > 0.5
         x -= 0.5
     end
-    halfstep = 0.5 * 1.0
+    halfstep = 0.5
     rho_max = 1.0 + halfstep
     rho_min = 1.0 - halfstep
     ret = rho_min + (rho_max - rho_min) * x / 0.5
@@ -184,8 +184,8 @@ end
 
 # sinewave.c: #define ORDER 1, RHO_MEAN 1.0
 @inline function _sinewave_density(particles::Particles, ipart::Int, density_function_correction)::Float64
-    x = particles.pos[ipart][1] / 1.0   # / Problem.Boxsize[0] (= 1)
-    ret = 1.0 * (1.0 + 0.5 * sin(2.0 * pi * 1.0 * x))
+    x = particles.pos[ipart][1]
+    ret = 1.0 + 0.5 * sin(2.0 * pi * x)
     ret += (ret - 1.0) * density_function_correction
     return ret
 end
@@ -217,8 +217,8 @@ end
 # periodic). Note: gradient.c does NOT apply the density_function_correction
 # (C `bias`) term.
 @inline function _gradient_density(particles::Particles, ipart::Int, density_function_correction)::Float64
-    x = particles.pos[ipart][1] / 1.0   # / Problem.Boxsize[0] (= 1)
-    halfstep = 0.5 * 1.0
+    x = particles.pos[ipart][1]
+    halfstep = 0.5
     rho_max = 1.0 + halfstep
     rho_min = 1.0 - halfstep
     if x <= 0.25
@@ -258,8 +258,8 @@ end
 @inline function _magneticum_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     p = particles.pos[ipart]
     bx = 1.0; by = 1.0; bz = 0.5
-    x = (p[1] - 0.0 * bx) / (1.0 * bx)
-    y = (p[2] - 0.0 * by) / (1.0 * by)
+    x = p[1] / bx
+    y = p[2] / by
     z = p[3] / bz
     rho = 1.0
     if z < 0.1 || z > 0.9
@@ -1081,7 +1081,7 @@ function setup_linear_alfven_wave(param::Parameters)
     bx = 1.0; by = 0.1; bz = 0.1
     function _alfven_density(particles::Particles, ipart::Int, density_function_correction)::Float64
         x = particles.pos[ipart][1] / bx
-        ret = 1.0 * (1.0 + 1e-6 * sin(2.0 * pi * 1.0 * x))
+        ret = 1.0 + 1e-6 * sin(2.0 * pi * x)
         ret += (ret - 1.0) * density_function_correction
         return ret
     end

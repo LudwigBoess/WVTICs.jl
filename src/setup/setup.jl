@@ -5,25 +5,6 @@
 #   1. allocate P / SphP (Npart)              -> `Particles(Npart)`
 #   2. setup_problem(Flag, Subflag)           -> `setup_problem(param)` (problems.jl)
 #   3. mpart_from_integral()                  -> 512^3 midpoint mass integral
-#
-# Standard Gadget units (setup.c lines 4-6): ULength = 3.08568025e21 cm,
-# UMass = 1.989e43 g, UVel = 1e5 cm/s. Wired via `GadgetUnits.GadgetPhysical`.
-
-"""
-    GADGET_UNITS :: GadgetPhysical
-
-Standard Gadget unit system used by WVTICs, exactly the constants hard-coded
-in `setup.c`:
-
-- `ULength = 3.08568025e21` cm  (kpc)
-- `UMass   = 1.989e43` g        (1e10 Msol)
-- `UVel    = 1e5` cm/s          (km/s)
-
-Built with `GadgetUnits.GadgetPhysical(l_unit, m_unit, v_unit)`. Phase 1 only
-needs the unit system available (it does not yet convert any quantity); later
-phases use it for physical-unit diagnostics.
-"""
-const GADGET_UNITS = GadgetPhysical(3.08568025e21, 1.989e43, 1.0e5)
 
 """
     setup(param::Parameters) -> (Particles, ProblemParameters)

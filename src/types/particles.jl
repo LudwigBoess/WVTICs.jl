@@ -31,8 +31,7 @@ Position / vector fields (C `P`):
 - `vel::Vector{SVector{3,Float32}}`  — `P.Vel`
 - `id::Vector{UInt32}`               — `P.ID` (authoritative, UInt32)
 - `type::Vector{Int32}`              — `P.Type` (all 0 = gas here)
-- `key::Vector{UInt128}`             — `P.Key` (128-bit Peano key; Phase 2+)
-- `tree_parent::Vector{Int32}`       — `P.Tree_Parent` (Phase 2+)
+- `key::Vector{UInt128}`             — `P.Key` (128-bit Peano key; domain decomposition)
 - `redistributed::Vector{Bool}`      — `P.Redistributed`
 
 Gas fields (C `SphP`), all `Float32` to match the C struct:
@@ -51,7 +50,6 @@ struct Particles
     id::Vector{UInt32}
     type::Vector{Int32}
     key::Vector{UInt128}
-    tree_parent::Vector{Int32}
     redistributed::Vector{Bool}
 
     u::Vector{Float32}
@@ -77,7 +75,6 @@ function Particles(n::Integer)
         zeros(UInt32, nn),
         zeros(Int32, nn),
         zeros(UInt128, nn),
-        zeros(Int32, nn),
         zeros(Bool, nn),
         zeros(Float32, nn),
         zeros(Float32, nn),

@@ -244,7 +244,7 @@ const ICS_PAR = "/e/ocean2/users/lboess/WVTICs/ics.par"
         @test eltype(ps.key) == UInt128
 
         # all parallel fields same length
-        for fld in (:pos, :vel, :id, :type, :key, :tree_parent,
+        for fld in (:pos, :vel, :id, :type, :key,
                     :redistributed, :u, :rho, :hsml, :varhsmlfac,
                     :rho_model, :bfld)
             @test length(getfield(ps, fld)) == n
@@ -373,9 +373,6 @@ end
             x, y, z = particles.pos[i]
             (0.0 <= x <= 1.0) && (0.0 <= y <= 1.0) && (0.0 <= z <= 1.0)
         end
-        # Peano sampling is deferred -> must error.
-        @test_throws ErrorException WVTICs.make_positions!(
-            particles, p, problem, prob; sampling = WVTICs.PeanoSampling)
     end
 
     @testset "make_ids!: spaced-ID algorithm (ids.c)" begin

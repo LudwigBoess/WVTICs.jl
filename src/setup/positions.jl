@@ -4,8 +4,7 @@
 # `make_positions!`  -> `positions.c::Make_Positions`
 #     uniform random sampling and von-Neumann rejection sampling.
 #     Rejection sampling is the DEFAULT (active C Makefile uses
-#     -DREJECTION_SAMPLING; CLAUDE.md §1.3). Peano-curve sampling is stubbed
-#     (deferred — see `make_positions!` docstring / PORT_STATUS.md).
+#     -DREJECTION_SAMPLING; CLAUDE.md §1.3).
 # `make_ids!`        -> `ids.c::Make_IDs`           (spaced IDs)
 # `make_velocities!` / `make_temperatures!` / `make_magnetic_fields!` /
 # `make_post_processing!` -> `positions.c::Make_{Velocities,Temperatures,
@@ -39,10 +38,8 @@ Sampling mode for [`make_positions!`](@ref) (the C compile flags
   the active C Makefile.
 - `UniformSampling`   — plain uniform random positions (C default build, no
   flag).
-- `PeanoSampling`     — Peano-curve walk sampling. **Stubbed / deferred**
-  (errors if requested); see PORT_STATUS.md.
 """
-@enum PositionSampling RejectionSampling UniformSampling PeanoSampling
+@enum PositionSampling RejectionSampling UniformSampling
 
 """
     make_positions!(particles, param, problem, prob;
@@ -58,7 +55,6 @@ Port of `positions.c::Make_Positions`. Fills `particles.pos[i]` for
   Uses `param.density_function_correction` (C `Param.BiasCorrection`) as the
   density-callback correction argument exactly like C.
 - `UniformSampling`: `pos = rand() .* Boxsize` per axis.
-- `PeanoSampling`: deferred — raises an error (Phase 1 scope note).
 
 Parallel sampling uses one `Xoshiro` RNG per chunk seeded reproducibly
 (`seed * chunk`), so a run is deterministic for a fixed thread count but
@@ -72,11 +68,6 @@ function make_positions!(particles::Particles, param::Parameters,
                          seed::Integer = RNG_BASE_SEED)
     n = param.Npart
     n == 0 && return nothing
-
-    if sampling === PeanoSampling
-        error("PEANO_SAMPLING is deferred in this port (Phase 1 stub); " *
-              "use RejectionSampling (default) or UniformSampling.")
-    end
 
     bx = problem.Boxsize[1]
     by = problem.Boxsize[2]

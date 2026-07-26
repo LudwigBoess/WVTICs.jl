@@ -14,7 +14,6 @@ using StaticArrays
 using NearestNeighbors
 using SPHKernels
 using GadgetIO
-using GadgetUnits
 using FFTW
 using LinearAlgebra
 using Random
