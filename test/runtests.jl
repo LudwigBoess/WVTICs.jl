@@ -437,7 +437,6 @@ end
             fn = joinpath(dir, "IC_test")
             out = WVTICs.write_output(particles, p, problem;
                                       verbose = false, filename = fn,
-                                      kernel = default_kernel_config(),
                                       output_diagnostics = true)
             @test out == fn
             @test isfile(fn)
@@ -452,12 +451,12 @@ end
             @test h.omega_0 == 0.0 && h.omega_l == 0.0 && h.h0 == 0.0
             @test h.z == 0.0 && h.time == 0.0
 
-            # block presence + exact order (default WC4 order + REDI)
+            # block presence + exact order (+ REDI)
             blocks = print_blocks(fn; verbose = false)
             @test blocks[1] == "HEAD"
             @test blocks[2] == "INFO"
             @test blocks[3:end] ==
-                  ["POS", "VEL", "ID", "RHO", "RHOM", "HSML", "U", "BFLD", "REDI"]
+                  ["POS", "VEL", "ID", "HSML", "RHO", "U", "BFLD", "RHOM", "REDI"]
 
             # custom InfoLines present
             info = read_info(fn)

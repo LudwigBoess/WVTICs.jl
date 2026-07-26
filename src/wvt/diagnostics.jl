@@ -192,7 +192,7 @@ function write_iteration_diagnostics(iteration::Int, error::Quadruplet,
 end
 
 """
-    write_step_file(particles, param, problem, it; kernel, output_diagnostics)
+    write_step_file(particles, param, problem, it; output_diagnostics)
 
 Port of `wvt_relax.c::writeStepFile` (`SAVE_WVT_STEPS`, default **off**).
 Writes a snapshot named `"<problem.Name>_NNN"` via the Phase-1 `write_output`
@@ -201,12 +201,11 @@ then restores `problem.Name`, exactly as the C temporarily rewrites
 """
 function write_step_file(particles::Particles, param::Parameters,
                          problem::ProblemParameters, it::Int;
-                         kernel::KernelConfig = default_kernel_config(),
                          output_diagnostics::Bool = true)
     base = problem.Name
     stepname = string(base, '_', _fmt_i03(it))
     write_output(particles, param, problem;
-                 verbose = false, kernel = kernel,
+                 verbose = false,
                  output_diagnostics = output_diagnostics,
                  filename = stepname)
     return stepname

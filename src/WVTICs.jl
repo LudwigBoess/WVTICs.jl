@@ -90,7 +90,7 @@ read_param_file -> setup -> make_positions! -> make_ids!
 
 The SPH `kernel` (and its dimension / `DESNNGB` / `NNGBDEV` / `NGBMAX`) is
 chosen at the call site via a [`KernelConfig`](@ref) and threaded through the
-relaxation and the snapshot writer; it defaults to
+relaxation; it defaults to
 [`default_kernel_config`](@ref) (Wendland C4, 3D — the active C Makefile
 default). Build a different one from a built-in kernel with
 `KernelConfig(WendlandC6; dim = 3)`, or from **any** `SPHKernels.jl` kernel
@@ -133,7 +133,7 @@ function make_sph_wvtics(parfile::AbstractString;
     # `bias_correction.c`, the artificial density-model correction diagnostic)
     # is a diagnostic print only — Phase 1+ (not yet ported / stubbed).
 
-    write_output(particles, param, problem; verbose = verbose, kernel = kernel)
+    write_output(particles, param, problem; verbose = verbose)
 
     verbose && println("done")
     return particles

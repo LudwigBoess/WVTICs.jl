@@ -272,7 +272,7 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
 
         # --- 3. SAVE_WVT_STEPS (default off) -------------------------------
         if save_wvt_steps
-            write_step_file(particles, param, problem, it; kernel = kc,
+            write_step_file(particles, param, problem, it;
                             output_diagnostics = output_diagnostics)
         end
 

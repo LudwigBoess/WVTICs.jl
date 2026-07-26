@@ -2,15 +2,15 @@
 # `add_block` / `set_block_info` / `fill_write_buffer`, using GadgetIO's
 # Gadget SnapFormat-2 writer.
 #
-# Block order (io.h `enum iofields`), all particles type 0 (gas):
-#   default            : POS, VEL, ID, RHO, RHOM, HSML, U, BFLD [, REDI]
-#   SPH_CUBIC_SPLINE   : POS, VEL, ID, U,  RHO,  HSML, BFLD, RHOM [, REDI]
+# Block order (all particles type 0, gas):
+#   POS, VEL, ID, HSML, RHO, U, BFLD, RHOM [, REDI]
+# A single order is used for every kernel. SnapFormat-2 tags each data block
+# with a 4-char label and readers seek by label, so the block sequence is not
+# semantically significant; the C `io.h` `#ifdef SPH_CUBIC_SPLINE` positional
+# reordering is unnecessary for a label-addressed reader.
 # `RHOM` ("Model Density") and `REDI` ("Redistributed") are custom blocks not
 # in GadgetIO's default INFO tables -> explicit `InfoLine`s are written.
-# The active C Makefile uses SPH_WC4 (NOT cubic spline) and has
-# OUTPUT_DIAGNOSTICS on by default, so the default order incl. REDI is the
-# Phase-1 default here; the cubic-spline reordering is selected from the
-# kernel config.
+# `REDI` is appended iff OUTPUT_DIAGNOSTICS (default on).
 #
 # Element types (io.c::set_block_info / fill_write_buffer):
 #   POS/VEL/BFLD : Float32, 3 components   (C casts double Pos/Vel to float)
@@ -19,20 +19,15 @@
 #   REDI         : Int32   (C writes P.Redistributed as int)
 
 """
-    snapshot_block_order(kcfg::KernelConfig; output_diagnostics=true)
-        -> Vector{Symbol}
+    snapshot_block_order(; output_diagnostics=true) -> Vector{Symbol}
 
-The Gadget-2 block order from `io.h`'s `enum iofields`. Cubic spline uses the
-reordered enum (`POS,VEL,ID,U,RHO,HSML,BFLD,RHOM`), every other kernel uses
-the default (`POS,VEL,ID,RHO,RHOM,HSML,U,BFLD`). `REDI` is appended iff
-`output_diagnostics` (C `OUTPUT_DIAGNOSTICS`, default on).
+The Gadget-2 data-block order `POS, VEL, ID, HSML, RHO, U, BFLD, RHOM`, with
+`REDI` appended iff `output_diagnostics` (C `OUTPUT_DIAGNOSTICS`, default on).
+One order is used for all kernels: SnapFormat-2 blocks are label-addressed, so
+the C `#ifdef SPH_CUBIC_SPLINE` positional reordering is not needed.
 """
-function snapshot_block_order(kcfg::KernelConfig; output_diagnostics::Bool = true)
-    order = if kcfg.kernel isa SPHKernels.Cubic
-        Symbol[:POS, :VEL, :ID, :U, :RHO, :HSML, :BFLD, :RHOM]
-    else
-        Symbol[:POS, :VEL, :ID, :RHO, :RHOM, :HSML, :U, :BFLD]
-    end
+function snapshot_block_order(; output_diagnostics::Bool = true)
+    order = Symbol[:POS, :VEL, :ID, :HSML, :RHO, :U, :BFLD, :RHOM]
     output_diagnostics && push!(order, :REDI)
     return order
 end
@@ -163,14 +158,14 @@ end
 
 """
     write_output(particles, param, problem;
-                 verbose = true, kernel = default_kernel_config(),
-                 output_diagnostics = true, filename = problem.Name)
+                 verbose = true, output_diagnostics = true,
+                 filename = problem.Name)
 
 Port of `io.c::Write_output`. Writes a Gadget **SnapFormat-2** snapshot:
 `HEAD` block, then a custom `INFO` block (so the custom `RHOM`/`REDI` blocks
-are self-describing and round-trippable), then the data blocks in the exact
-`io.h` order for the selected kernel (default vs. cubic-spline reordering;
-`REDI` appended iff `output_diagnostics`, matching C `OUTPUT_DIAGNOSTICS`).
+are self-describing and round-trippable), then the data blocks in the fixed
+`io.h` order (`REDI` appended iff `output_diagnostics`, matching C
+`OUTPUT_DIAGNOSTICS`).
 
 `filename` defaults to `problem.Name` (the C code writes to `Problem.Name` in
 the current working directory). Returns the path written.
@@ -178,11 +173,10 @@ the current working directory). Returns the path written.
 function write_output(particles::Particles, param::Parameters,
                        problem::ProblemParameters;
                        verbose::Bool = true,
-                       kernel::KernelConfig = default_kernel_config(),
                        output_diagnostics::Bool = true,
                        filename::AbstractString = problem.Name)
     n = param.Npart
-    order = snapshot_block_order(kernel; output_diagnostics = output_diagnostics)
+    order = snapshot_block_order(; output_diagnostics = output_diagnostics)
     header = build_snapshot_header(param, problem)
     info = snapshot_info_lines(order)
 
