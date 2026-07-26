@@ -2,80 +2,93 @@
 CurrentModule = WVTICs
 ```
 
-# WVTICs
+# WVTICs.jl
 
-Documentation for [WVTICs](https://github.com/LudwigBoess/WVTICs.jl).
+*Weighted Voronoi Tessellation initial conditions for SPH.*
 
-## Running on a cluster (distributed-memory, Phase D)
+WVTICs generates low-noise, glass-like initial conditions for smoothed-particle
+hydrodynamics. Given a target density field ``\rho(\mathbf{x})`` it relaxes a
+set of particle positions until their SPH density estimate matches
+``\rho`` — a *relaxed glass* with far less sampling noise than a random or
+lattice draw — then applies the problem's velocity, internal-energy and
+magnetic-field fields and writes a Gadget-2 (`SnapFormat 2`) snapshot.
 
-WVTICs has two parallel backends behind one interface (the serial/threaded
-port is the reference implementation; the distributed backend is purely
-additive):
+It is a Julia port of the WVT ICs generator by J. Donnert; see the
+[Arth et al. (2019)](https://arxiv.org/abs/1907.11250) method paper.
 
-* **Shared memory** — `Threads.@threads` / Polyester across the per-particle
-  loops. Just run with `julia -t <nthreads>`; nothing else is needed.
-* **Distributed memory** — `Distributed.jl` with a Peano–Hilbert
-  space-filling-curve domain decomposition, `2·max(hsml)` ghost halos and
-  collective global reductions. Hybrid: one Distributed worker per
-  rank/node, threads within each. Single-process it is byte-identical to the
-  threaded path.
+## The method in brief
 
-### Worker launch
+Each iteration:
 
-`init_workers(; manager=:auto, n=nothing)` is the single pluggable
-entry point:
+1. solve the SPH smoothing length and density for every particle
+   (Newton–Raphson on the kernel-weighted neighbour count);
+2. push every particle away from its neighbours with a repulsive,
+   kernel-weighted force scaled so the local particle spacing tracks the target
+   density;
+3. periodically apply a Monte-Carlo *redistribution* step (Metropolis) that
+   moves over-dense particles next to under-dense ones, to escape local minima;
+4. shrink the step size as the configuration converges.
 
-* `:local` → `addprocs(n)` (defaults to the CPU count),
-* `:slurm` → `addprocs(SlurmManager(n))`,
-* `:pbs`   → `addprocs(PBSManager(n))`,
-* `:auto`  → detects the scheduler from the environment
-  (`SLURM_JOB_ID`/`SLURM_NTASKS`/`SLURM_NNODES`,
-  `PBS_JOBID`/`PBS_NODEFILE`) and sizes the pool from the *allocation*
-  (not a hardcoded count). `--project` and `JULIA_DEPOT_PATH` are
-  propagated so every (possibly remote) node can `using WVTICs`.
+The result is a particle distribution whose number density ``\propto \rho``,
+suitable as an SPH IC.
 
-`plan_workers`, `detect_scheduler` and `scheduler_pool_size` are the
-side-effect-free planning helpers (unit-tested without a real scheduler).
-ClusterManagers is imported only by the distributed backend; the threaded
-port is runtime-independent of it.
+## Installation
 
-### Batch scripts
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/LudwigBoess/WVTICs.jl")
+```
 
-`examples/run_distributed.jl` is the scheduler-agnostic driver. Submit it
-with the example batch scripts (edit the absolute paths / parameter file):
+## Quick start
+
+Write a parameter file (see [Usage](@ref) for the full schema) — or use the
+bundled `parameters.toml` (a 2000-particle constant-density smoke test) — and
+run the driver:
+
+```julia
+using WVTICs
+
+# Reads the parameter file, runs the full pipeline, writes the snapshot,
+# and returns the relaxed `Particles`.
+particles = make_sph_wvtics("parameters.toml")
+```
+
+`make_sph_wvtics` is the only exported symbol; everything else is reachable via
+qualification (`WVTICs.KernelConfig`) or `using WVTICs: KernelConfig`.
+
+Choose a different SPH kernel at the call site:
+
+```julia
+using WVTICs: KernelConfig, WendlandC6
+make_sph_wvtics("ics.par"; kernel = KernelConfig(WendlandC6; dim = 3))
+```
+
+Run multi-threaded by starting Julia with threads — the per-particle loops
+scale across them automatically:
 
 ```sh
-sbatch examples/sbatch_wvtics.sh        # SLURM
-qsub   examples/qsub_wvtics.sh          # PBS / Torque
+julia -t 8 --project -e 'using WVTICs; make_sph_wvtics("ics.par")'
 ```
 
-or run locally for testing:
+## Features
 
-```sh
-WVTICS_NWORKERS=4 julia --project=/abs/WVTICs -t 4 \
-    examples/run_distributed.jl ics.par
-```
+- Target-density relaxation with periodic Monte-Carlo redistribution.
+- Any [`SPHKernels.jl`](https://github.com/LudwigBoess/SPHKernels.jl) kernel
+  (Cubic spline, Wendland C2/C4/C6/C8) with a runtime-selectable neighbour
+  count; genuine Dehnen–Aly kernel self-bias correction.
+- A registry of ready-made test problems (constant density, Kelvin–Helmholtz,
+  Sod, Sedov, Gresho, Orszag–Tang, …) selected by two integer flags.
+- Rejection or uniform position sampling.
+- Divergence-free turbulent magnetic-field generation.
+- ASCII (`tag value`) and TOML parameter files.
+- Gadget `SnapFormat 2` output via
+  [`GadgetIO.jl`](https://github.com/LudwigBoess/GadgetIO.jl), including custom
+  model-density (`RHOM`) and redistribution (`REDI`) blocks.
+- Shared-memory threading across every hot loop.
 
-### IO on a shared filesystem
+## Contents
 
-`write_output_distributed` writes one Gadget file per worker
-(`name.0 … name.{k-1}`, `num_files = nworkers()`), or gathers to a single
-file with `single_file=true`. All paths are taken as given — use
-absolute / shared-parallel-filesystem paths on HPC; no localhost
-co-location is assumed (message-passing only).
-
-### Correctness
-
-The GLOBAL converged density error and `norm_hsml` match the serial run to
-a documented statistical (not bit) tolerance — like the rest of the port,
-RNG/ordering differences make the equivalence statistical. The verified
-serial WVT step remains the single source of truth for the relaxation
-result; the distributed layer adds only the Peano decomposition, the ghost
-halo exchange and the collective reductions.
-
-```@index
-```
-
-```@autodocs
-Modules = [WVTICs]
+```@contents
+Pages = ["usage.md", "problems.md", "parallel.md", "api.md"]
+Depth = 2
 ```

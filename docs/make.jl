@@ -14,6 +14,10 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
+        "Usage" => "usage.md",
+        "Problems" => "problems.md",
+        "Parallelism" => "parallel.md",
+        "API" => "api.md",
     ],
 )
 
