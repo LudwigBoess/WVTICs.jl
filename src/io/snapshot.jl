@@ -27,92 +27,66 @@ One order is used for all kernels: SnapFormat-2 blocks are label-addressed, so
 the C `#ifdef SPH_CUBIC_SPLINE` positional reordering is not needed.
 """
 function snapshot_block_order(; output_diagnostics::Bool = true)
-    order = Symbol[:POS, :VEL, :ID, :HSML, :RHO, :U, :BFLD, :RHOM]
+    order = Symbol[b[1] for b in _SNAPSHOT_BLOCKS if b[1] !== :REDI]
     output_diagnostics && push!(order, :REDI)
     return order
 end
 
-# 4-char Gadget block label for each enum field (io.c::set_block_info).
-const _BLOCK_LABEL = Dict{Symbol,String}(
-    :POS  => "POS",
-    :VEL  => "VEL",
-    :ID   => "ID",
-    :RHO  => "RHO",
-    :RHOM => "RHOM",
-    :HSML => "HSML",
-    :U    => "U",
-    :BFLD => "BFLD",
-    :REDI => "REDI",
+# One spec per data block: (symbol, 4-char label, element type, #components,
+# Particles source field). The data-block order is this table's order; the
+# diagnostics-only REDI block is appended by `snapshot_block_order`. POS/VEL/
+# BFLD are 3-component Float32 (POS casts the Float64 positions); ID and REDI
+# are UInt32 (C writes Redistributed as an int); RHO/RHOM/HSML/U are Float32.
+const _SNAPSHOT_BLOCKS = (
+    (:POS,  "POS",  Float32, 3, :pos),
+    (:VEL,  "VEL",  Float32, 3, :vel),
+    (:ID,   "ID",   UInt32,  1, :id),
+    (:HSML, "HSML", Float32, 1, :hsml),
+    (:RHO,  "RHO",  Float32, 1, :rho),
+    (:U,    "U",    Float32, 1, :u),
+    (:BFLD, "BFLD", Float32, 3, :bfld),
+    (:RHOM, "RHOM", Float32, 1, :rho_model),
+    (:REDI, "REDI", UInt32,  1, :redistributed),
 )
+
+const _BLOCK_SPEC = Dict{Symbol,Tuple{String,DataType,Int,Symbol}}(
+    b[1] => (b[2], b[3], b[4], b[5]) for b in _SNAPSHOT_BLOCKS)
+
+_block_label(b::Symbol) = _BLOCK_SPEC[b][1]
 
 """
     snapshot_info_lines(order::Vector{Symbol}) -> Vector{InfoLine}
 
 Build the `INFO` block entries (one per data block, gas-only `is_present`),
-including the explicit custom `RHOM` / `REDI` lines (CLAUDE.md §1.8). Data
-types and dimensionality mirror `io.c::set_block_info`/`fill_write_buffer`.
+including the custom `RHOM` / `REDI` lines. Element types and component counts
+come from `_SNAPSHOT_BLOCKS`.
 """
 function snapshot_info_lines(order::Vector{Symbol})
     gas = Int32[1, 0, 0, 0, 0, 0]
-    lines = InfoLine[]
-    for b in order
-        if b === :POS || b === :VEL || b === :BFLD
-            push!(lines, InfoLine(_BLOCK_LABEL[b], Float32, Int32(3), copy(gas)))
-        elseif b === :ID
-            push!(lines, InfoLine("ID", UInt32, Int32(1), copy(gas)))
-        elseif b === :REDI
-            # C writes P.Redistributed via ((int*)wbuf); GadgetIO's INFO
-            # writer only encodes Float32/Float64/UInt32/UInt64 datatype
-            # names, so REDI is written as UInt32 (4-byte, like C int) for a
-            # round-trippable diagnostics-only block.
-            push!(lines, InfoLine("REDI", UInt32, Int32(1), copy(gas)))
-        else # RHO, RHOM, HSML, U  -> Float32 scalar
-            push!(lines, InfoLine(_BLOCK_LABEL[b], Float32, Int32(1), copy(gas)))
-        end
-    end
-    return lines
+    return [let (label, T, dim, _) = _BLOCK_SPEC[b]
+                InfoLine(label, T, Int32(dim), copy(gas))
+            end for b in order]
 end
 
-# Build the write buffer for one block (io.c::fill_write_buffer). POS/VEL/BFLD
-# become a 3xN Float32 matrix (GadgetIO writes Matrix column-major as N
-# vectors of length size(data,1)); scalars become a length-N vector.
-function _block_data(particles::Particles, b::Symbol, n::Int)
-    if b === :POS
-        d = Matrix{Float32}(undef, 3, n)
-        @inbounds for i in 1:n
-            p = particles.pos[i]
-            d[1, i] = Float32(p[1]); d[2, i] = Float32(p[2]); d[3, i] = Float32(p[3])
-        end
-        return d
-    elseif b === :VEL
-        d = Matrix{Float32}(undef, 3, n)
-        @inbounds for i in 1:n
-            v = particles.vel[i]
-            d[1, i] = v[1]; d[2, i] = v[2]; d[3, i] = v[3]
-        end
-        return d
-    elseif b === :BFLD
-        d = Matrix{Float32}(undef, 3, n)
-        @inbounds for i in 1:n
-            v = particles.bfld[i]
-            d[1, i] = v[1]; d[2, i] = v[2]; d[3, i] = v[3]
-        end
-        return d
-    elseif b === :ID
-        return copy(particles.id)::Vector{UInt32}
-    elseif b === :RHO
-        return copy(particles.rho)::Vector{Float32}
-    elseif b === :RHOM
-        return copy(particles.rho_model)::Vector{Float32}
-    elseif b === :HSML
-        return copy(particles.hsml)::Vector{Float32}
-    elseif b === :U
-        return copy(particles.u)::Vector{Float32}
-    elseif b === :REDI
-        return UInt32.(particles.redistributed)::Vector{UInt32}
-    else
-        error("Block not found $b")   # mirrors io.c Assert(0,"Block not found")
+# Float32 3xN matrix from a vector of 3-component SVectors (POS casts Float64).
+function _vec3_matrix(src::AbstractVector, n::Int)
+    d = Matrix{Float32}(undef, 3, n)
+    @inbounds for i in 1:n
+        v = src[i]
+        d[1, i] = Float32(v[1]); d[2, i] = Float32(v[2]); d[3, i] = Float32(v[3])
     end
+    return d
+end
+
+# Write buffer for one block (io.c::fill_write_buffer): a 3xN Float32 matrix
+# for the 3-component blocks, else a length-N vector of the block's element
+# type (ID/REDI → UInt32; RHO/RHOM/HSML/U → Float32).
+function _block_data(particles::Particles, b::Symbol, n::Int)
+    spec = get(_BLOCK_SPEC, b, nothing)
+    spec === nothing && error("Block not found $b")   # io.c Assert(0,...)
+    _, T, dim, src = spec
+    field = getfield(particles, src)
+    return dim == 3 ? _vec3_matrix(field, n) : T.(field)
 end
 
 """
@@ -193,7 +167,7 @@ function write_output(particles::Particles, param::Parameters,
         write_info_block(f, info; snap_format = 2)
         for b in order
             data = _block_data(particles, b, n)
-            write_block(f, data, _BLOCK_LABEL[b]; snap_format = 2)
+            write_block(f, data, _block_label(b); snap_format = 2)
         end
     finally
         close(f)

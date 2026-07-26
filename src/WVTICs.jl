@@ -16,6 +16,7 @@ using SPHKernels
 using GadgetIO
 using FFTW
 using LinearAlgebra
+using Printf
 using Random
 using Distributed
 using Logging: with_logger, NullLogger

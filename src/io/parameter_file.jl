@@ -130,25 +130,11 @@ function read_param_toml(filename::AbstractString)
         # Resolve legacy key aliases (legacy `BiasCorrection` key still
         # accepted, mapping to the renamed `density_function_correction`).
         key = _canonical_param_tag(rawkey)
-        idx = findfirst(t -> t[1] == key, _PARAM_TAGS)
-        idx === nothing && continue               # unknown key (e.g. PNG_Filename)
-        _, field, typ = _PARAM_TAGS[idx]
-        if typ === :int
-            setfield!(param, field, _toml_to_int(key, val))
-        else # :real
-            v = _toml_to_real(key, val)
-            if field === :limit1
-                limits[1] = v
-            elseif field === :limit2
-                limits[2] = v
-            elseif field === :limit3
-                limits[3] = v
-            elseif field === :limit4
-                limits[4] = v
-            else
-                setfield!(param, field, v)
-            end
-        end
+        entry = get(_PARAM_TAG_MAP, key, nothing)
+        entry === nothing && continue             # unknown key (e.g. PNG_Filename)
+        field, typ = entry
+        v = typ === :int ? _toml_to_int(key, val) : _toml_to_real(key, val)
+        _store_param!(param, limits, field, v)
     end
 
     param.LimitMps = (limits[1], limits[2], limits[3], limits[4])
@@ -175,6 +161,28 @@ const _PARAM_TAGS = Tuple{String,Symbol,Symbol}[
     ("Problem_Subflag",         :Problem_Subflag,         :int),
     ("DesNumNgb",               :DesNumNgb,               :int),
 ]
+
+# tag -> (field, type) for O(1) lookup by both the ASCII and TOML parsers.
+const _PARAM_TAG_MAP = Dict{String,Tuple{Symbol,Symbol}}(
+    t[1] => (t[2], t[3]) for t in _PARAM_TAGS)
+
+# Route a coerced value into the Parameters struct, or into the LimitMps
+# accumulator when the field is one of the four :limitN pseudo-fields.
+function _store_param!(param::Parameters, limits::Vector{Float64},
+                       field::Symbol, value)
+    if field === :limit1
+        limits[1] = value
+    elseif field === :limit2
+        limits[2] = value
+    elseif field === :limit3
+        limits[3] = value
+    elseif field === :limit4
+        limits[4] = value
+    else
+        setfield!(param, field, value)
+    end
+    return nothing
+end
 
 # Optional parameter tags (Julia-port extensions with no C analogue): parsed if
 # present but NOT required — unlike every C tag, each of which must appear in an
@@ -260,32 +268,18 @@ function _read_param_ascii(filename::AbstractString)
         tag = _canonical_param_tag(tokens[1])
         val = tokens[2]
 
-        idx = findfirst(t -> t[1] == tag, _PARAM_TAGS)
-        idx === nothing && continue               # unknown tag (e.g. PNG_Filename)
+        entry = get(_PARAM_TAG_MAP, tag, nothing)
+        entry === nothing && continue             # unknown tag (e.g. PNG_Filename)
         haskey(done, tag) && done[tag] && continue # tagDone: parse once
 
-        _, field, typ = _PARAM_TAGS[idx]
+        field, typ = entry
         if typ === :int
-            v = _c_atoi(val)
-            setfield!(param, field, Int(v))
-        else # :real
-            # `MpsFraction auto` (case-insensitive) ⇒ 0.0 auto-calibration
-            # sentinel (MPSFRACTION_ANALYSIS.md §4.3). Any numeric value
-            # parses exactly as before via the lenient C-atof port, so
-            # legacy `.par` files are byte-identical.
+            _store_param!(param, limits, field, _c_atoi(val))
+        else # :real — `MpsFraction auto` (case-insensitive) is the 0.0
+            # auto-calibration sentinel; any numeric value parses via _c_atof.
             v = (tag == "MpsFraction" && lowercase(strip(val)) == "auto") ?
                 0.0 : _c_atof(val)
-            if field === :limit1
-                limits[1] = v
-            elseif field === :limit2
-                limits[2] = v
-            elseif field === :limit3
-                limits[3] = v
-            elseif field === :limit4
-                limits[4] = v
-            else
-                setfield!(param, field, v)
-            end
+            _store_param!(param, limits, field, v)
         end
         done[tag] = true
     end

@@ -13,10 +13,6 @@
 #   * `SAVE_WVT_STEPS` is OFF by default → `writeStepFile(it)` writes
 #     `Problem.Name_NNN` via `Write_output(0)` then restores `Problem.Name`.
 #     Exposed here as a keyword flag, default off, matching the C default.
-#
-# `Printf` is intentionally NOT used (it is a stdlib but is not declared in
-# Project.toml; the Phase-3 constraints forbid adding deps).  The C
-# `%03d` / `%+7.5e` formats are reproduced by hand below.
 
 """
     Quadruplet
@@ -63,68 +59,15 @@ function calculate_stats_on(delta::NTuple{3,Vector{Float32}}, n::Int)
     return Quadruplet(vmin, vmax, mean, sigma)
 end
 
-# --- hand-rolled C printf equivalents (no Printf dep) -----------------------
+# C `%03d` iteration index and `%+7.5e` values via Printf (which reproduces
+# the C printf formats exactly). NaN/Inf keep the lowercase C spelling.
+_fmt_i03(n::Integer) = @sprintf("%03d", n)
 
-# C `"%03d"` — minimum 3 digits, zero-padded, with sign for negatives.
-function _fmt_i03(n::Integer)
-    neg = n < 0
-    s = string(abs(Int(n)))
-    if length(s) < 3
-        s = "0"^(3 - length(s)) * s
-    end
-    return neg ? "-" * s : s
-end
-
-# C `"%+7.5e"` — forced sign, 5 fractional digits, lowercase `e`, exponent
-# with explicit sign and ≥2 digits (the width-7 flag never pads here because
-# the mantissa+exponent already exceed 7 chars; C does not truncate either).
 function _fmt_e(x::Real)
     v = Float64(x)
-    if isnan(v)
-        return "+nan"
-    elseif isinf(v)
-        return v > 0 ? "+inf" : "-inf"
-    end
-    sign = v < 0 ? "-" : "+"
-    a = abs(v)
-    exp10 = 0
-    if a != 0.0
-        exp10 = floor(Int, log10(a))
-        mant = a / exp10_pow(exp10)
-        # guard against log10 rounding pushing mantissa out of [1,10)
-        if mant >= 10.0
-            mant /= 10.0
-            exp10 += 1
-        elseif mant < 1.0
-            mant *= 10.0
-            exp10 -= 1
-        end
-    else
-        mant = 0.0
-    end
-    # round mantissa to 5 fractional digits; carry can bump it to 10.0
-    scaled = round(mant * 1e5)
-    if scaled >= 1.0e6
-        scaled /= 10.0
-        scaled = round(scaled)
-        exp10 += 1
-    end
-    iscaled = Int(scaled)
-    intpart = div(iscaled, 100000)
-    fracpart = iscaled - intpart * 100000
-    fracs = string(fracpart)
-    fracs = "0"^(5 - length(fracs)) * fracs
-    esign = exp10 < 0 ? "-" : "+"
-    eabs = string(abs(exp10))
-    if length(eabs) < 2
-        eabs = "0"^(2 - length(eabs)) * eabs
-    end
-    return string(sign, intpart, '.', fracs, 'e', esign, eabs)
-end
-
-# 10^e for integer e, exactly for the range that occurs here.
-@inline function exp10_pow(e::Int)
-    return 10.0^e
+    isfinite(v) && return @sprintf("%+7.5e", v)
+    isnan(v) && return "+nan"
+    return v > 0 ? "+inf" : "-inf"
 end
 
 """
