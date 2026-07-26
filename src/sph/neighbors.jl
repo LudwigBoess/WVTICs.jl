@@ -1,23 +1,20 @@
-# Phase 2 — neighbour search (ports `tree.c`'s ngb role; replaces the linked
-# Peano octree with `NearestNeighbors.jl` per CLAUDE.md §1.5 / §4).
+# Neighbour search over a `NearestNeighbors.jl` KDTree.
 #
 # A plain `KDTree` is built over the positions (`Vector{SVector{3,Float64}}`,
-# `reorder=true`).  Periodicity is handled by **manual minimum-image
-# correction** after a plain-tree query — NOT `PeriodicTree`, whose dedup
-# buffer is mutable and not thread-safe (CLAUDE.md §4).  We query with a guard
-# radius (the candidate's true min-image distance can be smaller than its
-# Euclidean distance, but never larger when we add a per-axis box-image probe),
-# then re-test every candidate with the per-axis branchless min-image distance
-# gated by `Problem.Periodic`, exactly as `tree.c` corrects distances.
+# `reorder=true`).  Periodicity is handled by manual minimum-image correction
+# after a plain-tree query — NOT `PeriodicTree`, whose dedup buffer is mutable
+# and not thread-safe.  We query with a guard radius (a candidate's true
+# min-image distance can be smaller than its Euclidean distance, but never
+# larger once we add a per-axis box-image probe), then re-test every candidate
+# with the per-axis branchless min-image distance gated by `Problem.Periodic`.
 #
-# §4b optimisations implemented here:
-#   * branchless min-image  d -= L·round(d/L)  (no C `while` loop)
-#   * `inrangecount`        for allocation-free count-only Newton iterations
+# Building blocks:
+#   * branchless min-image  d -= L·round(d/L)  (no `while` loop)
+#   * `inrangecount`        allocation-free count-only queries
 #   * `inrange!`            into a caller-preallocated buffer for the final list
-#   * `query_candidates!`   "query once, iterate on a cached candidate list":
-#                           one ball query at an upper-bound radius, then the
-#                           Newton solve filters the cached candidates by
-#                           distance without re-querying the tree.
+#   * `query_candidates!`   one ball query at an upper-bound radius caches a
+#                           candidate list; the Newton solve then filters that
+#                           list by distance without re-querying the tree.
 
 using NearestNeighbors
 using StaticArrays
@@ -29,9 +26,8 @@ using StaticArrays
 """
     minimum_image(d, L, periodic) -> Float64
 
-Branchless minimum-image displacement along one axis (CLAUDE.md §4b):
-`d -= L·round(d/L)` when `periodic`, identity otherwise.  Replaces the C
-`while (d > boxhalf) d -= boxsize` loop in `sph.c` / `tree.c`.
+Branchless minimum-image displacement along one axis:
+`d -= L·round(d/L)` when `periodic`, identity otherwise.
 """
 @inline function minimum_image(d::Float64, L::Float64, periodic::Bool)
     return periodic ? d - L * round(d / L) : d
@@ -41,9 +37,7 @@ end
     periodic_dist2(a, b, box, periodic) -> Float64
 
 Squared distance between points `a` and `b` (`SVector{3,Float64}`) under
-per-axis minimum-image, `box::NTuple{3,Float64}`,
-`periodic::NTuple{3,Bool}`.  Matches the `r2` accumulation in
-`sph.c::Find_hsml` / `tree.c::Find_ngb_tree`.
+per-axis minimum-image, `box::NTuple{3,Float64}`, `periodic::NTuple{3,Bool}`.
 """
 @inline function periodic_dist2(a::SVector{3,Float64}, b::SVector{3,Float64},
                                 box::NTuple{3,Float64},
@@ -62,8 +56,8 @@ end
     build_tree(positions; leafsize = 32) -> KDTree
 
 Build a `KDTree` over `positions::Vector{SVector{3,Float64}}` with
-`reorder=true` (cache-locality; the tree subsumes the C Peano sort, CLAUDE.md
-§1.5).  Immutable and safe for concurrent read queries from multiple threads.
+`reorder=true` (cache-locality).  Immutable and safe for concurrent read
+queries from multiple threads.
 """
 function build_tree(positions::AbstractVector{SVector{3,Float64}};
                     leafsize::Int = 32)
@@ -84,18 +78,16 @@ end
 """
     guess_hsml(tree, positions, ipart, desnngb, box, periodic; dim=3) -> Float64
 
-Initial smoothing-length estimate replacing C `tree.c::Guess_hsml` (CLAUDE.md
-§1.5).  Uses a `knn` query for the `min(desnngb, N-1)+1`-th nearest neighbour
-distance and inflates it to the radius that, at the local number density,
-encloses ≈`DESNNGB` particles:
+Initial smoothing-length estimate.  Uses a `knn` query for the
+`min(desnngb, N-1)+1`-th nearest neighbour distance and inflates it to the
+radius that, at the local number density, encloses ≈`DESNNGB` particles:
 
     n_local ≈ k / (4π/3 · r_k³)     (3D)        n_local ≈ k / (π · r_k²)  (2D)
     hsml    = ( (4π/3·DESNNGB) / n_local·… )^(1/dim)  ⇒  r_k·(DESNNGB/k)^(1/dim)
 
-i.e. `r_k · (DESNNGB / k)^(1/dim)`.  Robust on glasses and clustered data;
-matches the spirit of the C parent-node number-density guess.  Periodic edge
-particles get a slightly small `r_k` from the plain tree — acceptable because
-`find_hsml`'s outer widen loop corrects any under/over-estimate.
+i.e. `r_k · (DESNNGB / k)^(1/dim)`.  Robust on glasses and clustered data.
+Periodic edge particles get a slightly small `r_k` from the plain tree —
+acceptable because `find_hsml`'s outer widen loop corrects any under/over-estimate.
 """
 function guess_hsml(tree::KDTree, positions::AbstractVector{SVector{3,Float64}},
                     ipart::Int, desnngb::Int,
@@ -123,13 +115,12 @@ end
 """
     query_candidates!(buf, tmp, tree, positions, point, radius, box, periodic) -> buf
 
-Fill `buf` (preallocated, will be `empty!`-ed) with **candidate** indices for a
+Fill `buf` (preallocated, will be `empty!`-ed) with candidate indices for a
 periodic fixed-radius query: all tree points within `radius` of `point` OR of
 any of `point`'s box images along the periodic axes.  The candidate set is a
 superset of the true minimum-image neighbour set within `radius`; the caller
-re-filters by `periodic_dist2`.  This is the "query once" half of the §4b
-cached-candidate pattern — call it ONCE at an upper-bound radius, then iterate
-the Newton solve over the returned list.
+re-filters by `periodic_dist2`.  Call it once at an upper-bound radius, then
+iterate the Newton solve over the returned list.
 
 Non-periodic axes use a single query; periodic axes additionally query the
 `±box` shifted points so a neighbour wrapped across a face is captured.  For
@@ -198,10 +189,9 @@ end
     periodic_inrangecount(tree, point, radius, periodic) -> Int
 
 Allocation-free neighbour count.  Non-periodic ⇒ a direct
-`NearestNeighbors.inrangecount` (the §4b allocation-free count path).
-Periodic ⇒ returns `-1`: a periodic count must re-test the per-axis
-minimum-image distance, which the density solver does allocation-free via
-[`count_within!`](@ref) over the cached candidate list.
+`NearestNeighbors.inrangecount`.  Periodic ⇒ returns `-1`: a periodic count
+must re-test the per-axis minimum-image distance, which the density solver does
+allocation-free via [`count_within!`](@ref) over the cached candidate list.
 """
 @inline function periodic_inrangecount(tree::KDTree,
                                         point::SVector{3,Float64},
@@ -219,8 +209,8 @@ end
     count_within!(cands, positions, point, r2max, box, periodic) -> Int
 
 Count cached candidate indices whose minimum-image squared distance to `point`
-is `< r2max`.  Allocation-free; used for the count-only Newton iterations
-(§4b) over the cached candidate list from [`query_candidates!`](@ref).
+is `< r2max`.  Allocation-free; used for the count-only Newton iterations over
+the cached candidate list from [`query_candidates!`](@ref).
 """
 @inline function count_within!(cands::Vector{Int},
                                positions::AbstractVector{SVector{3,Float64}},

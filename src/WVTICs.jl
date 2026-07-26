@@ -2,12 +2,8 @@ module WVTICs
 
 # ---------------------------------------------------------------------------
 # WVTICs — Weighted Voronoi Tessellation initial conditions.
-# Julia port of the C code in /e/ocean2/users/lboess/WVTICs/src.
-# See CLAUDE.md (alongside the C source) for the authoritative plan.
-#
-# Phase 0 scaffolding: types, parameter-file parser, SoA particle container,
-# and a `make_sph_wvtics(parfile)` driver reproducing the `main.c` call
-# sequence with stubs for the not-yet-ported stages.
+# Types, parameter-file parser, SoA particle container, and the
+# `make_sph_wvtics(parfile)` driver.
 # ---------------------------------------------------------------------------
 
 using StaticArrays
@@ -40,7 +36,6 @@ include("problems/problems.jl")
 # The swappable threaded driver (`_run_chunks` / `THREAD_BACKEND`) is included
 # BEFORE the hot-loop files (setup/sph/wvt) that call it, so the primitive and
 # its `Polyester`/`OhMyThreads` imports are in scope at their include time.
-# (`distributed.jl` is still a Phase-D stub and stays at the end.)
 include("parallel/threads.jl")
 
 # --- Setup / positions -----------------------------------------------------
@@ -55,7 +50,7 @@ include("sph/density.jl")
 # --- WVT loop --------------------------------------------------------------
 # diagnostics + redistribution before relax: relax.jl uses `Quadruplet`,
 # `calculate_stats_on`, the diagnostics writers, and the redistribution
-# entry points (Phase 3 wiring).
+# entry points.
 include("wvt/redistribution.jl")
 include("wvt/diagnostics.jl")
 include("wvt/relax.jl")
@@ -79,8 +74,8 @@ const VERSION_STR = TOML.parsefile(joinpath(@__DIR__, "..", "Project.toml"))["ve
                     kernel::KernelConfig = default_kernel_config(),
                     verbose::Bool = true) -> Particles
 
-Top-level driver and the **only** function this package exports. Reproduces
-the `main.c` call sequence:
+Top-level driver and the **only** function this package exports. Runs the
+full IC-generation pipeline:
 
 ```
 read_param_file -> setup -> make_positions! -> make_ids!
@@ -91,8 +86,7 @@ read_param_file -> setup -> make_positions! -> make_ids!
 The SPH `kernel` (and its dimension / `DESNNGB` / `NNGBDEV` / `NGBMAX`) is
 chosen at the call site via a [`KernelConfig`](@ref) and threaded through the
 relaxation; it defaults to
-[`default_kernel_config`](@ref) (Wendland C4, 3D — the active C Makefile
-default). Build a different one from a built-in kernel with
+[`default_kernel_config`](@ref) (Wendland C4, 3D). Build a different one from a built-in kernel with
 `KernelConfig(WendlandC6; dim = 3)`, or from **any** `SPHKernels.jl` kernel
 instance with `KernelConfig(SPHKernels.WendlandC6(Float64, 3); desnngb = 295)`
 — so kernels beyond the built-in set work without changing WVTICs.
@@ -129,9 +123,8 @@ function make_sph_wvtics(parfile::AbstractString;
     make_magnetic_fields!(particles, param, problem)
     make_post_processing!(particles, param, problem)
 
-    # `calculate_density_function_correction` (C `Calculate_Bias()` /
-    # `bias_correction.c`, the artificial density-model correction diagnostic)
-    # is a diagnostic print only — Phase 1+ (not yet ported / stubbed).
+    # The artificial density-model correction is a diagnostic print only and is
+    # not computed here.
 
     write_output(particles, param, problem; verbose = verbose)
 
@@ -147,18 +140,16 @@ end
 export make_sph_wvtics
 
 # --- Precompilation --------------------------------------------------------
-# Compile the hot path at precompile time so the first real call is fast. The
-# workload uses the constant-density problem (total mass exactly 1, so Mpart =
-# 1/Npart directly — the 512³ setup grid is skipped). The relaxation call tree
-# specialises per kernel type (KernelConfig{K} carries a concrete kernel), so
-# both the driver default (Wendland C4) and the cheap CubicSpline are compiled
-# through a full relaxation; the remaining kernels get their leaf value/deriv/
-# bias evaluations forced in 2D and 3D. The TOML parser and snapshot writer are
-# compiled into a temp dir so precompilation has no side effects.
+# Compile the hot path at precompile time so the first real call is fast. Uses
+# the constant-density problem (total mass 1, so Mpart = 1/Npart; setup grid
+# skipped). Wendland C4 and CubicSpline are compiled through a full relaxation;
+# the other kernels get their leaf value/deriv/bias evaluations forced in 2D
+# and 3D. The TOML parser and snapshot writer run in a temp dir (no side
+# effects).
 @setup_workload begin
     @compile_workload begin
-      # Silence logging: the tiny-N relaxation legitimately `@warn`s and
-      # GadgetIO `@info`s per block; neither should surface during precompile.
+      # Silence logging: the tiny-N relaxation `@warn`s and GadgetIO `@info`s
+      # per block; neither should surface during precompile.
       with_logger(NullLogger()) do
         # One full relaxation for a given kernel at particle count `np`.
         function _pc_relax(np::Int, kc::KernelConfig)

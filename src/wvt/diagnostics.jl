@@ -1,24 +1,20 @@
-# Phase 3 — diagnostics.  Ports `diagnostics.c` (+ `diagnostics.h`) and the
-# `wvt_relax.c::writeStepFile` / `SAVE_WVT_STEPS` snapshot hook.
+# Diagnostics: the per-iteration `diagnostics.log`, the displacement/error
+# summary stats, and the `SAVE_WVT_STEPS` snapshot hook.
 #
-# C reference behaviour:
-#   * `OUTPUT_DIAGNOSTICS` is ON by default → a `diagnostics.log` file with the
-#     exact tab-separated header from `diagnostics.c::initIterationDiagnostics`
-#     and one `%03d` + 13× `%+7.5e` row per iteration
-#     (`writeIterationDiagnostics`).
-#   * `calculateStatsOn(values[3], n)` → (min,max,mean,sigma) of the per-particle
+#   * `OUTPUT_DIAGNOSTICS` is on by default → a `diagnostics.log` file with a
+#     tab-separated header and one `%03d` + 13× `%+7.5e` row per iteration.
+#   * `calculate_stats_on(values, n)` → (min,max,mean,sigma) of the per-particle
 #     3-vector magnitude `v = sqrt(vx²+vy²+vz²)`, with
-#     `sigma = sqrt(Σv²/n − mean²)` (NB: the C accumulates `v2`, not `v`, into
-#     `sigma`, i.e. variance of the *magnitude*).
-#   * `SAVE_WVT_STEPS` is OFF by default → `writeStepFile(it)` writes
-#     `Problem.Name_NNN` via `Write_output(0)` then restores `Problem.Name`.
-#     Exposed here as a keyword flag, default off, matching the C default.
+#     `sigma = sqrt(Σv²/n − mean²)` — variance of the *magnitude* (sigma
+#     accumulates `v²`, not `v`).
+#   * `SAVE_WVT_STEPS` is off by default → `write_step_file(it)` writes
+#     `<Name>_NNN` then restores the problem name. Exposed as a keyword flag,
+#     default off.
 
 """
     Quadruplet
 
-Port of C `struct Quadruplet { double min, max, mean, sigma; }` — the
-min/max/mean/sigma summary used for the error and the displacement.
+The min/max/mean/sigma summary used for the error and the displacement.
 """
 struct Quadruplet
     min::Float64
@@ -30,12 +26,11 @@ end
 """
     calculate_stats_on(delta::NTuple{3,Vector{Float32}}, n) -> Quadruplet
 
-Port of `diagnostics.c::calculateStatsOn`.  Over the 3-component displacement
-`delta` (`delta[1]/[2]/[3]` parallel `Vector{Float32}`), compute the
-min/max/mean and `sigma = sqrt(Σ‖δ‖² / n − mean²)` of the magnitude
-`‖δ‖ = sqrt(δx²+δy²+δz²)`.  Faithful to the C: `mean` accumulates `v`,
-`sigma` accumulates `v2 = v²` (variance of the magnitude, **not** of the
-components).
+Over the 3-component displacement `delta` (`delta[1]/[2]/[3]` parallel
+`Vector{Float32}`), compute the min/max/mean and
+`sigma = sqrt(Σ‖δ‖² / n − mean²)` of the magnitude `‖δ‖ = sqrt(δx²+δy²+δz²)`.
+`mean` accumulates `v`, `sigma` accumulates `v²` — variance of the magnitude,
+**not** of the components.
 """
 function calculate_stats_on(delta::NTuple{3,Vector{Float32}}, n::Int)
     if n <= 0
@@ -59,8 +54,8 @@ function calculate_stats_on(delta::NTuple{3,Vector{Float32}}, n::Int)
     return Quadruplet(vmin, vmax, mean, sigma)
 end
 
-# C `%03d` iteration index and `%+7.5e` values via Printf (which reproduces
-# the C printf formats exactly). NaN/Inf keep the lowercase C spelling.
+# `%03d` iteration index and `%+7.5e` values via Printf. NaN/Inf are written
+# lowercase.
 _fmt_i03(n::Integer) = @sprintf("%03d", n)
 
 function _fmt_e(x::Real)
@@ -73,10 +68,9 @@ end
 """
     DIAGNOSTICS_LOG_HEADER
 
-The exact `diagnostics.c::initIterationDiagnostics` header line.  The C source
-uses a backslash line-continuation that injects the source indentation
-(12 spaces) before `dmps/100`; reproduced verbatim so a parser written against
-the C output behaves identically.
+The tab-separated `diagnostics.log` header line.  The 12 spaces before
+`dmps/100` are part of the header verbatim (so a parser expecting them behaves
+identically).
 """
 const DIAGNOSTICS_LOG_HEADER =
     "Iter\tError min\tError max\tError mean\tError sigma\tError diff\t" *
@@ -86,9 +80,8 @@ const DIAGNOSTICS_LOG_HEADER =
 """
     init_iteration_diagnostics(path = "diagnostics.log")
 
-Port of `diagnostics.c::initIterationDiagnostics`: (re)create the log file and
-write the column header.  Called once before the WVT loop (C `OUTPUT_DIAGNOSTICS`
-default on).
+(Re)create the log file and write the column header.  Called once before the
+WVT loop (`OUTPUT_DIAGNOSTICS` default on).
 """
 function init_iteration_diagnostics(path::AbstractString = "diagnostics.log")
     open(path, "w") do fp
@@ -102,10 +95,9 @@ end
                                 move_mps::NTuple{4}, delta::Quadruplet;
                                 path = "diagnostics.log")
 
-Port of `diagnostics.c::writeIterationDiagnostics`: append one row
-`%03d` + 13× `%+7.5e` (tab-separated, newline-terminated) to the log.
-Column order matches the C exactly: iter, error{min,max,mean,sigma},
-errDiff, moveMps[0..3], delta{min,max,mean,sigma}.
+Append one row `%03d` + 13× `%+7.5e` (tab-separated, newline-terminated) to the
+log.  Column order: iter, error{min,max,mean,sigma}, errDiff, moveMps[0..3],
+delta{min,max,mean,sigma}.
 """
 function write_iteration_diagnostics(iteration::Int, error::Quadruplet,
                                      diff_error::Real,
@@ -137,10 +129,9 @@ end
 """
     write_step_file(particles, param, problem, it; output_diagnostics)
 
-Port of `wvt_relax.c::writeStepFile` (`SAVE_WVT_STEPS`, default **off**).
-Writes a snapshot named `"<problem.Name>_NNN"` via the Phase-1 `write_output`
-then restores `problem.Name`, exactly as the C temporarily rewrites
-`Problem.Name`.  Not verbose (C calls `Write_output(0)`).
+`SAVE_WVT_STEPS` snapshot (default **off**).  Writes a snapshot named
+`"<problem.Name>_NNN"` via `write_output`, then restores `problem.Name`.
+Not verbose.
 """
 function write_step_file(particles::Particles, param::Parameters,
                          problem::ProblemParameters, it::Int;

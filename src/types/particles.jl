@@ -1,21 +1,8 @@
-# Struct-of-arrays particle container (CLAUDE.md §2, Option A — recommended).
-#
-# Replaces the buggy `Gas` PhysicalParticles stub. Mirrors the C `P` /`SphP`
-# layout (`globals.h`):
-#
-#   struct ParticleData    { double Pos[3]; double Vel[3]; int32_t ID;
-#                            int Type; peanoKey Key; int Tree_Parent;
-#                            bool Redistributed; } *P;
-#   struct GasParticleData { float U; float Rho; float Hsml; float VarHsmlFac;
-#                            float ID; float Rho_Model; float Bfld[3]; } *SphP;
+# Struct-of-arrays particle container.
 #
 # SoA layout chosen because it is `NearestNeighbors.jl`'s fast input path, it
 # vectorises, and it reorders cheaply (Peano / KDTree reorder). Positions are
-# `SVector{3,Float64}`; the rest are `Float32` matching the C `SphP` types.
-#
-# `SphP.ID` in C is a (redundant) `float` copy of `P.ID`; it is preserved here
-# as a parallel field for output/round-trip fidelity but `id` is the
-# authoritative UInt32 ID.
+# `SVector{3,Float64}`; the rest are `Float32`.
 
 using StaticArrays
 
@@ -26,21 +13,21 @@ Struct-of-arrays container for all SPH particles. All vectors are kept the
 same length (`Npart`); index `i` addresses particle `i` consistently across
 every field.
 
-Position / vector fields (C `P`):
-- `pos::Vector{SVector{3,Float64}}`  — `P.Pos` (double precision)
-- `vel::Vector{SVector{3,Float32}}`  — `P.Vel`
-- `id::Vector{UInt32}`               — `P.ID` (authoritative, UInt32)
-- `type::Vector{Int32}`              — `P.Type` (all 0 = gas here)
-- `key::Vector{UInt128}`             — `P.Key` (128-bit Peano key; domain decomposition)
-- `redistributed::Vector{Bool}`      — `P.Redistributed`
+Position / vector fields:
+- `pos::Vector{SVector{3,Float64}}`  — positions (double precision)
+- `vel::Vector{SVector{3,Float32}}`  — velocities
+- `id::Vector{UInt32}`               — particle IDs (authoritative, UInt32)
+- `type::Vector{Int32}`              — particle type (all 0 = gas here)
+- `key::Vector{UInt128}`             — 128-bit Peano key (domain decomposition)
+- `redistributed::Vector{Bool}`      — redistribution flag
 
-Gas fields (C `SphP`), all `Float32` to match the C struct:
-- `u::Vector{Float32}`               — `SphP.U`
-- `rho::Vector{Float32}`             — `SphP.Rho`
-- `hsml::Vector{Float32}`            — `SphP.Hsml`
-- `varhsmlfac::Vector{Float32}`      — `SphP.VarHsmlFac`
-- `rho_model::Vector{Float32}`       — `SphP.Rho_Model`
-- `bfld::Vector{SVector{3,Float32}}` — `SphP.Bfld`
+Gas fields, all `Float32`:
+- `u::Vector{Float32}`               — internal energy
+- `rho::Vector{Float32}`             — density
+- `hsml::Vector{Float32}`            — smoothing length
+- `varhsmlfac::Vector{Float32}`      — variable-hsml factor
+- `rho_model::Vector{Float32}`       — model (target) density
+- `bfld::Vector{SVector{3,Float32}}` — magnetic field
 
 Construct an all-zero container of length `n` with `Particles(n)`.
 """
@@ -64,7 +51,7 @@ end
     Particles(n::Integer)
 
 Allocate a zero-initialised [`Particles`](@ref) container holding `n`
-particles (all type 0 / gas, matching the C code where every particle is gas).
+particles (all type 0 / gas).
 """
 function Particles(n::Integer)
     n >= 0 || throw(ArgumentError("number of particles must be ≥ 0, got $n"))

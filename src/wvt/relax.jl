@@ -1,11 +1,11 @@
-# Phase 3 — Regularise_sph_particles, the core WVT relaxation loop.
-# Faithful port of `wvt_relax.c::Regularise_sph_particles` (CLAUDE.md §1.4).
+# Core WVT relaxation loop: relax particle positions toward the model density
+# field via the repulsive WVT scheme with periodic Metropolis redistribution.
 #
-# Per iteration (exact C order, see wvt_relax.c lines 71–317):
-#   1. find_sph_quantities!  (reuse the Phase-2 solve + returned KDTree;
-#      hsml is preserved between iterations as the Newton seed, §4b)
+# Per iteration:
+#   1. find_sph_quantities!  (reuses the returned KDTree; hsml is kept as the
+#      Newton seed)
 #   2. it++ > Maxiter → break
-#   3. (SAVE_WVT_STEPS off by default) writeStepFile
+#   3. (SAVE_WVT_STEPS off by default) write_step_file
 #   4. reset_redistribution_flags!; if it ≤ LastMoveStep && it % RedistFreq == 0:
 #        moveFraction = MoveFractionMax · exp(-decay·(it/RedistFreq - 1)),
 #        decay = log(MoveFractionMax/MoveFractionMin)/(LastMoveStep/RedistFreq - 1),
@@ -19,7 +19,7 @@
 #   7. WVT repulsive displacement:
 #        delta += step·h·wk·d̂,  h = 0.5(hsml_i+hsml_j),
 #        wk = sph_kernel(r,h)·h³ (2D ·h²), skip self and r²>h²,
-#        Assert r²>0 (two coincident particles → C error message)
+#        error out if r²==0 (two coincident particles)
 #   8. move + per-axis box wrap; moveMps[k] = % with |δ| > {1,.1,.01,.001}·d_mps,
 #      d_mps = (4π/3·Hsml³/DESNNGB)^(1/3) (2D (π·Hsml²/DESNNGB)^(1/3))
 #   9. it==1 low/high-movement warnings
@@ -27,19 +27,19 @@
 #  11. converge: break if any moveMps[k] < LimitMps[k];
 #      step *= StepReduction if cnt1 > last_cnt and NOT a redistribution step
 #
-# §4b optimisations applied (all kept correct, see PORT_STATUS.md):
-#   * Verlet / skin neighbour list: the per-particle candidate index list is
-#     cached at radius `query_r = max_hsml·1.05 + r_skin` and REUSED across
-#     iterations for BOTH the density solve (via find_sph_quantities!'s tree
-#     reuse) and the displacement loop; the KDTree + candidate lists are
-#     rebuilt only when the max accumulated displacement since the last build
-#     exceeds 0.5·r_skin (the Verlet criterion).  `r_skin` = a fraction of the
-#     mean-particle-spacing-scaled hsml (see `_skin_radius`).
-#   * Hsml-seed reuse: hsml is NOT zeroed between iterations (find_sph!
-#     reuses it as the Newton seed → ~1–2 inner iterations).
-#   * Branchless minimum-image (periodic_dist2 / minimum_image, Phase 2).
-#   * Chunk-indexed Threads.@threads (per-chunk scratch indexed by the loop
-#     variable c — NEVER threadid(); the Phase-1 anti-pattern).
+# Key optimisations:
+#   * Verlet / skin neighbour list: each particle's candidate index list is
+#     cached at radius `query_r = max_hsml·1.05 + r_skin` and reused across
+#     iterations for both the density solve and the displacement loop; the
+#     KDTree + candidate lists are rebuilt only when the max accumulated
+#     displacement since the last build exceeds 0.5·r_skin (Verlet criterion).
+#     `r_skin` is a fraction of the mean-particle-spacing-scaled hsml
+#     (see `_skin_radius`).
+#   * hsml is NOT zeroed between iterations: find_sph! reuses it as the Newton
+#     seed (→ ~1–2 inner iterations).
+#   * Branchless minimum-image (periodic_dist2 / minimum_image).
+#   * Chunked threading: per-chunk scratch indexed by the loop variable c,
+#     NEVER threadid() (race-safe).
 
 using StaticArrays
 
@@ -47,51 +47,46 @@ using StaticArrays
 # spacing that sets the WVT step scale.
 @inline _npart_1d(n::Int, dim::Int) = dim == 2 ? n^(1.0 / 2.0) : n^(1.0 / 3.0)
 
-# C `Find_sph_quantities` rebuilds the octree every iteration.  We instead use
-# a Verlet skin: the cached candidate lists (and the KDTree) stay valid while
-# every particle has moved < 0.5·r_skin since the last build.  r_skin is set
-# to a fraction of the *model* hsml scale (≈ mean particle spacing), which is
-# the radius the displacement loop and the density solve actually probe.
+# Verlet skin: the cached candidate lists (and the KDTree) stay valid while
+# every particle has moved < 0.5·r_skin since the last build. r_skin is a
+# fraction of the model hsml scale (≈ mean particle spacing), the radius the
+# displacement loop and the density solve actually probe.
 const _WVT_SKIN_FRACTION = 0.5    # r_skin = 0.5 · mean(model hsml)
 
 @inline _skin_radius(mean_hsml::Float64) = _WVT_SKIN_FRACTION * mean_hsml
 
 # --- MpsFraction auto-calibration constants --------------------------------
-# (MPSFRACTION_ANALYSIS.md §3 / §4.3 — algorithm constants, NOT user
-# parameters.) `MpsFraction <= 0.0` (omitted / 0.0 / the parser's "auto"
-# sentinel) ⇒ the hybrid analytic-seed + bisection safety net runs; any
-# finite positive `MpsFraction` ⇒ exact legacy behaviour, byte-identical.
+# `MpsFraction <= 0.0` (omitted / 0.0 / "auto" sentinel) ⇒ the analytic-seed +
+# bisection auto-calibration runs; any finite positive `MpsFraction` ⇒ the
+# step formula `1/(npart_1D·MpsFraction)`.
 #
-# Analytic seed (Option A): the constant-density README geometric-centre
-# `MpsFraction` value, dimension-aware (≈0.8 in 3D, ≈0.1 in 2D — the value
-# parameters.toml already hinted). `step` is then formed from it exactly as
-# the legacy formula does (`1/(npart_1D·MpsFraction)`).
+# Analytic seed: the constant-density geometric-centre `MpsFraction`,
+# dimension-aware (≈0.8 in 3D, ≈0.1 in 2D). `step` is formed from it via the
+# formula `1/(npart_1D·MpsFraction)`.
 const MPS_AUTO_SEED_3D = 0.8
 const MPS_AUTO_SEED_2D = 0.1
 # Target / accept band for moveMps[0] (% of particles with |δ| > d_mps after
-# the first displacement pass): the band the C `it==1` warnings encode
-# (wvt_relax.c:281–289 — <10% "decrease MpsFraction", >80% "increase"). We
-# bisect `step` toward the band centre so StepReduction has the most room.
+# the first displacement pass), matching the it==1 warnings (<10% ⇒ "decrease
+# MpsFraction", >80% ⇒ "increase"). We bisect `step` toward the band centre.
 const MPS_AUTO_BAND_LO = 10.0
 const MPS_AUTO_BAND_HI = 80.0
 const MPS_AUTO_TARGET = 40.0
-# Total trial budget (1 seed + bracket + bisection); analysis §3.3 worst case.
+# Total trial budget (1 seed + bracket + bisection).
 const MPS_AUTO_MAX_TRIALS = 12
 
 @inline _is_auto_mps(mpsfraction::Real) =
     !(isfinite(mpsfraction) && mpsfraction > 0.0)
 
-# Analytic-seed `step` for the auto path (legacy formula with the seed
-# MpsFraction, dimension-aware npart_1D — identical algebra to the C
-# `step = 1/(npart_1D·MpsFraction)`).
+# Analytic-seed `step` for the auto path: the formula
+# `1/(npart_1D·MpsFraction)` with the seed MpsFraction and dimension-aware
+# npart_1D.
 @inline function _analytic_seed_step(n::Int, dim::Int)
     seed_mps = dim == 2 ? MPS_AUTO_SEED_2D : MPS_AUTO_SEED_3D
     return 1.0 / (_npart_1d(n, dim) * seed_mps)
 end
 
-# Per-chunk scratch for the displacement loop: a cached candidate list per
-# particle is held in the shared `cand_lists`; `qtmp` is the per-image query
-# scratch for `query_candidates!`.  Indexed by the chunk loop variable.
+# Per-chunk scratch for the displacement loop: `qtmp` is the per-image query
+# scratch for `query_candidates!`. Indexed by the chunk loop variable.
 struct WvtScratch
     qtmp::Vector{Int}
 end
@@ -102,17 +97,15 @@ WvtScratch() = WvtScratch(Int[])
         save_wvt_steps = false, output_diagnostics = true,
         diagnostics_path = "diagnostics.log", seed = RNG_BASE_SEED) -> particles
 
-Faithful port of `wvt_relax.c::Regularise_sph_particles` (CLAUDE.md §1.4).
 Relaxes `particles.pos` toward the model density field via the WVT repulsive
 scheme, with periodic Metropolis redistribution.  Writes
 `particles.hsml/rho/varhsmlfac/rho_model/pos`.
 
 * `prob::Problem` — problem callbacks (`prob.density` is the model density).
 * `kc::KernelConfig` — kernel + DESNNGB/NNGBDEV/NGBMAX/dim (WVTNNGB = DESNNGB).
-* `save_wvt_steps` — C `SAVE_WVT_STEPS`, default **off** (writes a snapshot
-  per iteration via `write_step_file`).
-* `output_diagnostics` — C `OUTPUT_DIAGNOSTICS`, default **on** (writes
-  `diagnostics.log`).
+* `save_wvt_steps` — default **off**; writes a snapshot per iteration via
+  `write_step_file`.
+* `output_diagnostics` — default **on**; writes `diagnostics.log`.
 
 Returns `particles` (mutated in place).
 """
@@ -137,15 +130,13 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     mpart = Float64(problem.Mpart)
     wvtnngb = desnngb                       # C: #define WVTNNGB DESNNGB
 
-    # C: median_boxsize = fmax(Boxsize[1], Boxsize[2]) (0-based) → here the
-    # 1-based equivalent over the two non-largest axes (Boxsize[1] is largest).
+    # median_boxsize = max over the two non-largest axes (Boxsize[1] is largest).
     median_boxsize = max(box[2], box[3])
 
-    # `MpsFraction <= 0.0` (omitted / 0.0 / the parser's "auto" sentinel) ⇒
-    # the hybrid analytic-seed + bisection auto-calibration runs (below, once
-    # the scratch arrays exist). A finite POSITIVE value ⇒ exact legacy
-    # behaviour: step = 1/(npart_1D·MpsFraction), npart_1D = N^(1/3) (2D
-    # N^(1/2)) — byte-identical to the pre-substep formula / the C code.
+    # `MpsFraction <= 0.0` (omitted / 0.0 / "auto" sentinel) ⇒ the analytic-seed
+    # + bisection auto-calibration runs (below, once the scratch arrays exist).
+    # A finite positive value ⇒ step = 1/(npart_1D·MpsFraction), npart_1D =
+    # N^(1/3) (2D N^(1/2)).
     auto_mps = _is_auto_mps(param.MpsFraction)
     step = auto_mps ? 0.0 : 1.0 / (_npart_1d(n, dim) * param.MpsFraction)
 
@@ -162,9 +153,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                 param.LimitMps[3], ",", param.LimitMps[4], ")")
     end
 
-    # model-density metric hsml (C `hsml[]`, distinct from SphP.Hsml) and the
-    # displacement accumulator (C `delta[3][]`, kept Float32 to match
-    # diagnostics.c::calculateStatsOn precision).
+    # model-density metric hsml (distinct from the SPH-solve Hsml) and the
+    # displacement accumulator (kept Float32 to match calculate_stats_on).
     mhsml = zeros(Float64, n)
     dx = zeros(Float32, n)
     dy = zeros(Float32, n)
@@ -184,15 +174,12 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     nc = length(chunks)
     wscratch = [WvtScratch() for _ in 1:nc]
 
-    # --- MpsFraction startup auto-calibration (MPSFRACTION_ANALYSIS.md §3) -
-    # Only when MpsFraction was omitted/0.0/"auto". Reuses the step-
-    # independent tree/density solve/model-hsml/candidate lists ONCE and
-    # bisects `step` so the first-iteration moveMps[0] lands in the C
-    # author's band. Does NOT mutate particle positions and does NOT advance
-    # the relaxation; the main loop below then proceeds completely unchanged
-    # (it rebuilds its own it==1 tree/solve from the same untouched
-    # positions). The transient mhsml/cand_lists scratch written here is
-    # fully overwritten by the loop's first iteration before use.
+    # --- MpsFraction startup auto-calibration --------------------------------
+    # Only when MpsFraction was omitted/0.0/"auto". Computes the step-
+    # independent tree/density solve/model-hsml/candidate lists once and
+    # bisects `step` so the first-iteration moveMps[0] lands in the accept
+    # band. Does not mutate positions and does not advance the relaxation; the
+    # main loop rebuilds its own it==1 tree/solve from the untouched positions.
     if auto_mps
         step = _autocalibrate_step(particles, param, problem, prob, kc,
                                    mhsml, deltas, cand_lists, wscratch,
@@ -200,9 +187,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                                    desnngb, wvtnngb, mpart, median_boxsize;
                                    verbose = verbose)
         # zero the scratch the calibration touched so the main loop starts
-        # from the same clean state as the legacy path (cand_lists/mhsml are
-        # recomputed at it==1; deltas is overwritten each displacement pass —
-        # zero it defensively so no stale calibration displacement leaks).
+        # clean (cand_lists/mhsml are recomputed at it==1; deltas is defensively
+        # zeroed so no stale calibration displacement leaks).
         fill!(dx, 0.0f0)
         fill!(dy, 0.0f0)
         fill!(dz, 0.0f0)
@@ -224,17 +210,14 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     while true
 
         # --- 0. Verlet rebuild gate (BEFORE the SPH solve) ----------------
-        # The C rebuilds its spatial index at the start of *every* iteration
-        # (inside Find_sph_quantities).  We keep a Verlet skin instead: the
-        # KDTree is rebuilt only when the max accumulated min-image
-        # displacement since the last build exceeds 0.5·r_skin (or on the
-        # first iteration, or right after a redistribution — flagged via
-        # have_lists=false).  Doing this BEFORE find_sph! guarantees the
-        # density solve AND the displacement loop consume the same
-        # fresh-enough tree.  r_skin is carried from the previous iteration
-        # (the model-density length scale is essentially static — total box
-        # volume is conserved — so this is the standard Verlet construction);
-        # the first iteration has r_skin==0 ⇒ have_lists==false ⇒ rebuild.
+        # Rebuild the KDTree only when the max accumulated min-image
+        # displacement since the last build exceeds 0.5·r_skin (or on the first
+        # iteration, or right after a redistribution — flagged via
+        # have_lists=false). Doing this before find_sph! guarantees the density
+        # solve and the displacement loop consume the same fresh-enough tree.
+        # r_skin is carried from the previous iteration (the model-density
+        # length scale is essentially static — box volume is conserved). The
+        # first iteration has r_skin==0 ⇒ have_lists==false ⇒ rebuild.
         tree_rebuilt = false
         if !have_lists
             tree = build_tree(particles.pos)
@@ -250,14 +233,14 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
         end
 
         # --- 1. SPH quantities (hsml/rho/varhsmlfac/rho_model) -------------
-        # find_sph! also reuses particles.hsml as the Newton seed (§4b — do
-        # NOT zero it).  `tree` is fresh-enough by the Verlet gate above.
+        # find_sph! reuses particles.hsml as the Newton seed (do NOT zero it).
+        # `tree` is fresh-enough by the Verlet gate above.
         tree = find_sph_quantities!(particles, param, problem, prob, kc;
                                     tree = tree)
 
         # --- 2. iteration / Maxiter ---------------------------------------
         it += 1
-        if it - 1 > param.Maxiter      # C: `if (it++ > Maxiter)` (post-incr)
+        if it - 1 > param.Maxiter
             verbose && println("Max iterations reached, result might not be ",
                                "converged properly.")
             break
@@ -274,8 +257,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
         if it <= param.LastMoveStep && it % param.RedistributionFrequency == 0
             firstIt = 1
             amplitude = param.MoveFractionMax
-            # C: LastMoveStep / RedistributionFrequency is INTEGER division
-            # (both int); likewise it / RedistributionFrequency.
+            # LastMoveStep/RedistributionFrequency and it/RedistributionFrequency
+            # are integer divisions (both operands int).
             decay_denom = div(param.LastMoveStep,
                               param.RedistributionFrequency) - firstIt
             decay = log(param.MoveFractionMax / param.MoveFractionMin) /
@@ -283,23 +266,10 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
             moveFraction = amplitude *
                 exp(-decay *
                     (div(it, param.RedistributionFrequency) - firstIt))
-            # Documented, intentional deviation from wvt_relax.c
-            # (CLAUDE.md §1.4 / PORT_STATUS.md).  The C computes `decay`
-            # with a `LastMoveStep/RedistributionFrequency - 1` denominator
-            # and then casts `Npart*moveFraction` to `int`.  When that
-            # denominator is <= 0 (e.g. LastMoveStep == RedistributionFrequency
-            # ⇒ div == 1 ⇒ denom == 0) the C divides by zero, and with
-            # MoveFractionMax == MoveFractionMin the numerator log(1) == 0
-            # too, so `decay` becomes 0/0 = NaN, `moveFraction` NaN, and the
-            # C silently casts NaN to `int` (undefined garbage, no crash).
-            # Julia's `Int`/`floor(Int, …)` correctly refuses NaN/Inf
-            # (InexactError).  We therefore guard the degenerate /
-            # non-finite case the C leaves undefined: skip the
-            # redistribution step for this iteration (treat as
-            # movePart == 0 / no redistribution) instead of computing
-            # Int(NaN).  This is strictly safer and produces NO behavioural
-            # change for well-posed parameters (decay_denom > 0 and finite
-            # decay/moveFraction), where the exact C arithmetic is kept.
+            # Guard the degenerate/non-finite case (decay_denom <= 0, NaN
+            # moveFraction — e.g. LastMoveStep == RedistributionFrequency with
+            # MoveFractionMax == MoveFractionMin): skip redistribution this
+            # iteration. No change for well-posed parameters.
             if decay_denom > 0 && isfinite(decay) && isfinite(moveFraction)
                 movePart = floor(Int, param.Npart * moveFraction)
                 maxProbes = floor(Int, param.Npart * param.ProbesFraction *
@@ -314,8 +284,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                     println("Redistributed ", nm,
                             " particles after probing ", np, " particles")
                 end
-                # C re-runs Find_sph_quantities() after the moves.  Force a
-                # tree + candidate-list rebuild (positions jumped arbitrarily).
+                # re-run the SPH solve after the moves; force a tree +
+                # candidate-list rebuild (positions jumped arbitrarily).
                 tree = find_sph_quantities!(particles, param, problem, prob,
                                             kc; tree = nothing)
                 copyto!(ref_pos, particles.pos)
@@ -351,14 +321,13 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                                 mpart, voln, dim, median_boxsize)
 
         # --- Verlet skin: refresh the cached candidate lists --------------
-        # r_skin scales with the (normalised) model hsml — the radius the
-        # displacement loop probes (carried to the next iteration's top-of-
-        # loop tree-rebuild gate).  query_r ≥ the largest possible pair
-        # h = 0.5(hsml_i+hsml_j) PLUS the mutual-drift margin r_skin, so a
-        # neighbour can drift up to 2·(0.5·r_skin) before the gate forces a
-        # rebuild and the cached list is still a faithful superset (test 7).
-        # The candidate lists are rebuilt exactly when the tree was rebuilt
-        # this iteration (Verlet gate at step 0) — never on stale positions.
+        # r_skin scales with the normalised model hsml — the radius the
+        # displacement loop probes (carried to the next iteration's rebuild
+        # gate). query_r ≥ the largest possible pair h = 0.5(hsml_i+hsml_j)
+        # plus the mutual-drift margin r_skin, so a neighbour can drift up to
+        # 2·(0.5·r_skin) before the gate forces a rebuild and the cached list
+        # is still a complete superset. The candidate lists are rebuilt exactly
+        # when the tree was rebuilt this iteration — never on stale positions.
         r_skin = _skin_radius(mean_hsml)
         query_r = max_hsml_norm * 1.05 + r_skin
 
@@ -411,9 +380,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
             break
         end
 
-        # force convergence if the distribution doesn't tighten and we are
-        # NOT on a redistribution step (C `wvt_relax.c:311` condition, EXACTLY
-        # — byte-identical for 3D and for the normal 2D tightening case).
+        # force convergence if the distribution doesn't tighten (cnt1 > last_cnt)
+        # and we are NOT on a redistribution step.
         reduced = false
         if cnt1 > last_cnt &&
            (it > param.LastMoveStep ||
@@ -422,41 +390,15 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
             reduced = true
         end
 
-        # 2D-only supplementary anneal (PORT_STATUS.md "Phase 4 follow-up:
-        # 2D relaxation plateau"). The C `cnt1 > last_cnt` proxy for "the
-        # distribution does not tighten" is STRUCTURALLY DEAD whenever
-        # `cnt1 == 0`: `last_cnt` is the previous `cnt1` (≥ 0, or `floatmax`
-        # on it=1), so `0 > last_cnt` is provably FALSE for every reachable
-        # state — the C never reduces `step` once the Dmps/10 band empties.
-        # In 3D `d_mps` is the true mean particle spacing, so the Dmps/10
-        # band stays populated (and noisily fluctuates ⇒ `cnt1 > last_cnt`
-        # fires) right up to the converged frozen glass; `cnt1` only reaches
-        # exactly 0 at/after that glass, where the C `LimitMps` stop has
-        # already broken — so 3D never relies on this branch and is left
-        # byte-identical (further guarded by `dim == 2`).
-        #
-        # In 2D the C `d_mps = (π·h²/DESNNGB)^(1/3)` (wvt_relax.c:225, the
-        # documented `1.0/3.0`-in-2D quirk, faithfully ported) is the cube
-        # root of an AREA — dimensionally `spacing^(2/3)`, numerically ≈ 5×
-        # the true mean spacing in box units. The Dmps/10 band therefore
-        # empties (`cnt1 → 0`) within ~100 iterations while the glass is
-        # still loose (moveMps[3] ≈ 95–100%, errMean ≈ 0.11 and DRIFTING UP),
-        # the C trigger goes permanently dead, `step` freezes at the
-        # auto-calibrated (intentionally band-centred, hence large) value,
-        # and the relaxation jitters at a noisy non-equilibrium forever — the
-        # exact reported symptom. We restore the C author's stated INTENT
-        # ("force convergence if distribution doesnt tighten",
-        # wvt_relax.c:310) using the dimension-robust signal the C itself
-        # already computes every iteration: the mean density error stopped
-        # improving (`errDiff = (errLast - errMean)/errMean ≤ 0`). Only when
-        # the C trigger is structurally dead (`cnt1 == 0`), the glass is
-        # NOT yet at the C stop (`moveMps[4] ≥ LimitMps[4]`, i.e. the run
-        # would otherwise continue forever), AND the error is not improving,
-        # AND we are not on a C-protected redistribution step — apply the
-        # SAME `step *= StepReduction`. This cannot ever co-fire with the C
-        # trigger (mutually exclusive on `cnt1 == 0`) and changes nothing in
-        # 3D (dim guard + the regime is unreachable before the 3D glass has
-        # converged), so the legacy/auto/3D behaviour is preserved.
+        # 2D-only supplementary anneal. The `cnt1 > last_cnt` convergence
+        # trigger goes permanently dead once the Dmps/10 band empties (cnt1 == 0
+        # ⇒ 0 > last_cnt is always false), so the step never anneals and the
+        # glass jitters forever. In 2D this happens while the glass is still
+        # loose because d_mps is a cube-root of an area (~5× the true spacing).
+        # When cnt1 == 0, the run is not yet at the LimitMps stop, the error is
+        # not improving (errDiff ≤ 0), and we are not on a redistribution step,
+        # apply the same step *= StepReduction. Gated to dim == 2 so 3D is
+        # unchanged (there the band stays populated until the glass has frozen).
         if dim == 2 && !reduced && cnt1 == 0 &&
            errDiff <= 0.0 &&
            moveMps[4] >= param.LimitMps[4] &&
@@ -481,8 +423,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                                      kwargs...)
 end
 
-# model-density metric hsml (ports wvt_relax.c lines 122–138).  Function
-# barrier on the `prob.density` ::Function field (`dfun::F` is concrete inside).
+# Fill the model-density metric hsml. Function barrier on the `prob.density`
+# ::Function field (`dfun::F` is concrete inside).
 function _fill_model_hsml!(particles::Particles, mhsml::Vector{Float64},
                            dfun::F, n::Int, density_function_correction,
                            wvtnngb::Float64, mpart::Float64, voln::Float64,
@@ -529,21 +471,19 @@ function _model_hsml_metric!(particles::Particles, mhsml::Vector{Float64},
 end
 
 # --- MpsFraction startup auto-calibration ----------------------------------
-# MPSFRACTION_ANALYSIS.md §3/§4: analytic seed + log-space bisection of
-# `step` so the first-iteration moveMps[0] lands in the C author's
-# (MPS_AUTO_BAND_LO, MPS_AUTO_BAND_HI) band, targeting the centre.
+# Analytic seed + log-space bisection of `step` so the first-iteration
+# moveMps[0] lands in the (MPS_AUTO_BAND_LO, MPS_AUTO_BAND_HI) band, targeting
+# the centre.
 #
-# Step-INDEPENDENT work (the KDTree, the SPH density solve / d_mps inputs,
-# the model-hsml metric, and the cached candidate lists) is computed ONCE;
-# only the displacement pass + the count-only moveMps[0] tally are recomputed
-# per trial, on scratch `deltas` (positions are NEVER mutated — calibration
-# does not advance the relaxation; the main loop then runs unchanged).
+# Step-independent work (the KDTree, the SPH density solve, the model-hsml
+# metric, and the cached candidate lists) is computed once; only the
+# displacement pass + the count-only moveMps[0] tally are recomputed per trial,
+# on scratch `deltas` (positions are never mutated).
 #
-# moveMps[0] is provably monotone increasing in `step` for fixed positions
-# (|δ| ∝ step, d_mps fixed by the density solve — analysis §3.2), so a clean
-# bracket + geometric bisection on log(step) is safe. Falls back to the
-# analytic-Courant "never worse than legacy" seed if the band is unreachable
-# within MPS_AUTO_MAX_TRIALS (analysis §4.4). Returns a finite positive step.
+# moveMps[0] is monotone increasing in `step` for fixed positions (|δ| ∝ step,
+# d_mps fixed by the density solve), so a bracket + geometric bisection on
+# log(step) is safe. Falls back to the analytic seed if the band is unreachable
+# within MPS_AUTO_MAX_TRIALS. Returns a finite positive step.
 function _autocalibrate_step(particles::Particles, param::Parameters,
                              problem::ProblemParameters, prob::Problem,
                              kc::KernelConfig, mhsml::Vector{Float64},
@@ -637,8 +577,7 @@ function _autocalibrate_step(particles::Particles, param::Parameters,
 
     if !bracketed
         # Could not bracket the target within the budget (e.g. a
-        # near-discontinuous Sod-like field). Fall back to the analytic
-        # "never worse than legacy" seed and continue (analysis §4.4).
+        # near-discontinuous Sod-like field). Fall back to the analytic seed.
         verbose && println("   WARNING: MpsFraction auto-calibration could ",
                            "not bracket the target in ", trials,
                            " trials; falling back to the analytic seed ",
@@ -685,10 +624,9 @@ end
 # --- per-chunk function barriers for the WVT parallel loops ----------------
 # Every relax hot loop runs through `_run_chunks` (see src/parallel/threads.jl)
 # with a thin `do c -> _xxx_chunk!(c, ...)` forwarder so the closure captures
-# only concrete, already-typed arguments (NO boxed fat closure). The bodies
-# below are byte-for-byte the previously-inline `Threads.@threads` bodies;
-# each chunk writes only its own per-chunk slot (NEVER threadid-indexed), so
-# results and determinism are identical across all three backends.
+# only concrete, already-typed arguments (no boxed closure). Each chunk writes
+# only its own per-chunk slot (indexed by the loop var c, NEVER threadid), so
+# results and determinism are identical across backends.
 
 @noinline function _error_stats_chunk!(c::Int, chunks::Vector{UnitRange{Int}},
                                        particles::Particles, dfun::F,
@@ -777,7 +715,7 @@ end
             ddy = minimum_image(pi3[2] - pj[2], box[2], periodic[2])
             ddz = minimum_image(pi3[3] - pj[3], box[3], periodic[3])
             r2 = ddx * ddx + ddy * ddy + ddz * ddz
-            # C: Assert(r2 > 0, "Found two particles ... same location")
+            # two coincident particles → error out
             r2 > 0.0 || error(
                 "Found two particles $ipart & $jpart at the same " *
                 "location. Consider increasing the space between your " *
@@ -802,11 +740,10 @@ end
     return nothing
 end
 
-# moveMps count math (ports wvt_relax.c lines 217–246), factored out of the
-# move loop so it can be reused by the startup auto-calibration *without*
-# mutating particle positions or any other state. Pure function of the
-# displacement magnitudes + `hsmlv` (the SPH-solve `Hsml`, the C `d_mps`
-# input) — byte-identical to the count the C / the move loop computes.
+# moveMps count math, factored out of the move loop so it can be reused by the
+# startup auto-calibration without mutating particle positions or any other
+# state. Pure function of the displacement magnitudes + `hsmlv` (the SPH-solve
+# Hsml, the d_mps input).
 @inline function _count_move_thresholds(ipart::Int,
                                         dx::Vector{Float32},
                                         dy::Vector{Float32},
@@ -830,7 +767,7 @@ end
     return b0, b1, b2, b3
 end
 
-# Count-only chunk: the moveMps[0..3] tallies WITHOUT touching `pos` or any
+# Count-only chunk: the moveMps[0..3] tallies without touching `pos` or any
 # other state (the calibration trial path). Same arithmetic as the move loop.
 @noinline function _count_moves_chunk!(c::Int,
                                        chunks::Vector{UnitRange{Int}},
@@ -879,8 +816,7 @@ end
     lc2 = 0
     lc3 = 0
     @inbounds for ipart in chunks[c]
-        # exact same count math as the count-only path (factored helper) so
-        # the legacy / normal-loop behaviour is byte-identical to before.
+        # same count math as the count-only path (shared helper).
         b0, b1, b2, b3 = _count_move_thresholds(ipart, dx, dy, dz, hsmlv,
                                                 desnngb, voln, dim)
         b0 && (lc += 1)
@@ -906,7 +842,6 @@ end
 end
 
 # --- relative-density-error reduction (chunked, no threadid indexing) ------
-# C: `#pragma omp parallel for reduction(...)` over relativeDensityError.
 # `dfun::F` (the `prob.density` ::Function field) is passed concretely so the
 # threaded reduction stays type-stable (function barrier).
 function _error_stats(particles::Particles, dfun::F, n::Int,
@@ -964,7 +899,7 @@ function _rebuild_candidate_lists!(cand_lists::Vector{Vector{Int}},
     return nothing
 end
 
-# --- WVT repulsive displacement (ports wvt_relax.c lines 151–213) ----------
+# --- WVT repulsive displacement --------------------------------------------
 function _wvt_displacement!(particles::Particles, mhsml::Vector{Float64},
                             deltas::NTuple{3,Vector{Float32}},
                             cand_lists::Vector{Vector{Int}},
@@ -983,10 +918,9 @@ function _wvt_displacement!(particles::Particles, mhsml::Vector{Float64},
 end
 
 # --- move + per-axis box wrap + moveMps thresholds ------------------------
-# Ports wvt_relax.c lines 217–270.  The C wrap is a per-axis `while` loop:
-# while Pos<0 Pos+=L; while Pos>L Pos-=L  (note: strict `> L`, not `>= L`).
-# Reproduced exactly (NOT branchless min-image — the spec requires the C
-# wrap semantics here, incl. the non-periodic axes which the C wraps too).
+# Per-axis wrap: while Pos<0 Pos+=L; while Pos>L Pos-=L (strict `> L`, not
+# `>= L`). Applied to all axes, including non-periodic ones. Not branchless
+# min-image — the wrap semantics here differ.
 @inline function _box_wrap(x::Float64, L::Float64)
     L <= 0.0 && return x
     while x < 0.0
@@ -1019,10 +953,9 @@ function _move_particles!(particles::Particles,
 end
 
 # Count-only sibling of `_move_particles!`: returns the same
-# (cnt,cnt1,cnt2,cnt3) tallies the move loop would produce for the given
-# scratch displacements, WITHOUT moving any particle (used by the startup
-# auto-calibration trials — positions/state are never mutated). Same chunk /
-# threading discipline (per-chunk slot indexed by the loop var, no threadid).
+# (cnt,cnt1,cnt2,cnt3) tallies for the given scratch displacements without
+# moving any particle (used by the startup auto-calibration trials). Same
+# per-chunk threading discipline (slot indexed by the loop var, no threadid).
 function _count_moves(particles::Particles,
                       deltas::NTuple{3,Vector{Float32}},
                       desnngb::Float64, voln::Float64, dim::Int,

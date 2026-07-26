@@ -1,30 +1,25 @@
-# Write_output — Julia port of `io.c::Write_output` / `write_header` /
-# `add_block` / `set_block_info` / `fill_write_buffer`, using GadgetIO's
-# Gadget SnapFormat-2 writer.
+# Writes a Gadget SnapFormat-2 snapshot via GadgetIO (ports io.c::Write_output).
 #
 # Block order (all particles type 0, gas):
 #   POS, VEL, ID, HSML, RHO, U, BFLD, RHOM [, REDI]
-# A single order is used for every kernel. SnapFormat-2 tags each data block
-# with a 4-char label and readers seek by label, so the block sequence is not
-# semantically significant; the C `io.h` `#ifdef SPH_CUBIC_SPLINE` positional
-# reordering is unnecessary for a label-addressed reader.
-# `RHOM` ("Model Density") and `REDI` ("Redistributed") are custom blocks not
-# in GadgetIO's default INFO tables -> explicit `InfoLine`s are written.
-# `REDI` is appended iff OUTPUT_DIAGNOSTICS (default on).
+# One order is used for every kernel: SnapFormat-2 tags each block with a 4-char
+# label and readers seek by label, so the block sequence is not semantically
+# significant. `RHOM` ("Model Density") and `REDI` ("Redistributed") are custom
+# blocks absent from GadgetIO's default INFO tables, so explicit `InfoLine`s are
+# written. `REDI` is appended iff OUTPUT_DIAGNOSTICS (default on).
 #
-# Element types (io.c::set_block_info / fill_write_buffer):
-#   POS/VEL/BFLD : Float32, 3 components   (C casts double Pos/Vel to float)
-#   ID           : UInt32
+# Element types:
+#   POS/VEL/BFLD    : Float32, 3 components
+#   ID/REDI         : UInt32
 #   RHO/RHOM/HSML/U : Float32, 1 component
-#   REDI         : Int32   (C writes P.Redistributed as int)
 
 """
     snapshot_block_order(; output_diagnostics=true) -> Vector{Symbol}
 
-The Gadget-2 data-block order `POS, VEL, ID, HSML, RHO, U, BFLD, RHOM`, with
-`REDI` appended iff `output_diagnostics` (C `OUTPUT_DIAGNOSTICS`, default on).
-One order is used for all kernels: SnapFormat-2 blocks are label-addressed, so
-the C `#ifdef SPH_CUBIC_SPLINE` positional reordering is not needed.
+The data-block order `POS, VEL, ID, HSML, RHO, U, BFLD, RHOM`, with `REDI`
+appended iff `output_diagnostics` (default on). One order is used for all
+kernels: SnapFormat-2 blocks are label-addressed, so no positional reordering is
+needed.
 """
 function snapshot_block_order(; output_diagnostics::Bool = true)
     order = Symbol[b[1] for b in _SNAPSHOT_BLOCKS if b[1] !== :REDI]
@@ -36,7 +31,7 @@ end
 # Particles source field). The data-block order is this table's order; the
 # diagnostics-only REDI block is appended by `snapshot_block_order`. POS/VEL/
 # BFLD are 3-component Float32 (POS casts the Float64 positions); ID and REDI
-# are UInt32 (C writes Redistributed as an int); RHO/RHOM/HSML/U are Float32.
+# are UInt32; RHO/RHOM/HSML/U are Float32.
 const _SNAPSHOT_BLOCKS = (
     (:POS,  "POS",  Float32, 3, :pos),
     (:VEL,  "VEL",  Float32, 3, :vel),
@@ -83,7 +78,7 @@ end
 # type (ID/REDI → UInt32; RHO/RHOM/HSML/U → Float32).
 function _block_data(particles::Particles, b::Symbol, n::Int)
     spec = get(_BLOCK_SPEC, b, nothing)
-    spec === nothing && error("Block not found $b")   # io.c Assert(0,...)
+    spec === nothing && error("Block not found $b")   # unknown block
     _, T, dim, src = spec
     field = getfield(particles, src)
     return dim == 3 ? _vec3_matrix(field, n) : T.(field)
@@ -92,10 +87,10 @@ end
 """
     build_snapshot_header(param, problem) -> SnapshotHeader
 
-Port of `io.c::write_header`. All particles are type 0 (gas):
+Build the snapshot header. All particles are type 0 (gas):
 `npart[1] = nall[1] = Npart`, `massarr[1] = Mpart`, `boxsize = Boxsize[1]`
-(C `Problem.Boxsize[0]`, the largest axis), cosmology fields 0,
-`num_files = 1`. (`SnapshotHeader` vectors are 1-based; index 1 == C type 0.)
+(the largest axis), cosmology fields 0, `num_files = 1`. (`SnapshotHeader`
+vectors are 1-based; index 1 is type 0.)
 """
 function build_snapshot_header(param::Parameters, problem::ProblemParameters)
     npart = zeros(Int32, 6)
@@ -115,7 +110,7 @@ function build_snapshot_header(param::Parameters, problem::ProblemParameters)
         nall,                        # nall
         Int32(0),                    # flag_cooling
         Int32(1),                    # num_files
-        problem.Boxsize[1],          # boxsize (C Header.BoxSize = Boxsize[0])
+        problem.Boxsize[1],          # boxsize (largest axis)
         0.0,                         # omega_0
         0.0,                         # omega_l
         0.0,                         # h0
@@ -135,14 +130,13 @@ end
                  verbose = true, output_diagnostics = true,
                  filename = problem.Name)
 
-Port of `io.c::Write_output`. Writes a Gadget **SnapFormat-2** snapshot:
-`HEAD` block, then a custom `INFO` block (so the custom `RHOM`/`REDI` blocks
-are self-describing and round-trippable), then the data blocks in the fixed
-`io.h` order (`REDI` appended iff `output_diagnostics`, matching C
-`OUTPUT_DIAGNOSTICS`).
+Write a Gadget **SnapFormat-2** snapshot: the `HEAD` block, then a custom `INFO`
+block (so the custom `RHOM`/`REDI` blocks are self-describing and
+round-trippable), then the data blocks in the fixed order (`REDI` appended iff
+`output_diagnostics`).
 
-`filename` defaults to `problem.Name` (the C code writes to `Problem.Name` in
-the current working directory). Returns the path written.
+`filename` defaults to `problem.Name` (written in the current working
+directory). Returns the path written.
 """
 function write_output(particles::Particles, param::Parameters,
                        problem::ProblemParameters;

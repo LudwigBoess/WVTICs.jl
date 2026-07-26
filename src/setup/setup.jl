@@ -1,23 +1,21 @@
-# Setup — Julia port of `setup.c::Setup`, `setup_problem` (dispatch) and
-# `mpart_from_integral`.
+# Allocates particles, selects the problem, and computes the particle mass
+# (ports setup.c::Setup, setup_problem, mpart_from_integral).
 #
-# C `Setup()`:
-#   1. allocate P / SphP (Npart)              -> `Particles(Npart)`
-#   2. setup_problem(Flag, Subflag)           -> `setup_problem(param)` (problems.jl)
-#   3. mpart_from_integral()                  -> 512^3 midpoint mass integral
+# `setup`:
+#   1. allocate particles (Npart)             -> `Particles(Npart)`
+#   2. select the problem from the registry   -> `setup_problem(param)` (problems.jl)
+#   3. compute Mpart                          -> 512^3 midpoint mass integral
 
 """
     setup(param::Parameters) -> (Particles, ProblemParameters)
 
-Port of `setup.c::Setup`. Allocates the SoA [`Particles`](@ref) container,
-selects the problem from `(Problem_Flag, Problem_Subflag)` via the problem
-registry (`problems.jl`), fills [`ProblemParameters`](@ref) (name, boxsize,
-periodicity, `Rho_Max`), and computes `Mpart` by 512³ midpoint integration of
-the density model (`mpart_from_integral`).
+Allocate the SoA [`Particles`](@ref) container, select the problem from
+`(Problem_Flag, Problem_Subflag)` via the problem registry (`problems.jl`), fill
+[`ProblemParameters`](@ref) (name, boxsize, periodicity, `Rho_Max`), and compute
+`Mpart` by 512³ midpoint integration of the density model
+(`mpart_from_integral`).
 
-The C `Boxsize[0]` (axis 0) = largest-axis invariant is asserted with the
-same message ("Boxsize[0] has to be largest for ngb finding to work."); in
-the Julia 1-based layout this is `Boxsize[1]`.
+Asserts that `Boxsize[1]` is the largest axis (required for neighbour finding).
 """
 function setup(param::Parameters)
     particles = Particles(param.Npart)
@@ -26,13 +24,13 @@ function setup(param::Parameters)
 
     problem = ProblemParameters(
         Name = prob.name,
-        Mpart = 1.0,                 # renormalised below (C sets Problem.Mpart=1)
+        Mpart = 1.0,                 # renormalised below
         Boxsize = prob.boxsize,
         Rho_Max = prob.rho_max,
         Periodic = prob.periodic,
     )
 
-    # C: Assert(Boxsize[0] >= Boxsize[1] && Boxsize[0] >= Boxsize[2], ...)
+    # require the first axis to be the largest (for neighbour finding)
     (problem.Boxsize[1] >= problem.Boxsize[2] &&
      problem.Boxsize[1] >= problem.Boxsize[3]) ||
         error("Boxsize[0] has to be largest for ngb finding to work.")
@@ -63,8 +61,7 @@ end
 
 # Per-chunk function barrier for `mpart_from_integral`'s outer parallel loop.
 # Concrete, type-annotated args only (no boxed capture): each chunk owns
-# `scratch[c]` (race-free probe) and writes only `partial[c]`. Identical for
-# every threading backend.
+# `scratch[c]` (race-free probe) and writes only `partial[c]`.
 @noinline function _mpart_chunk!(c::Int, chunks::Vector{UnitRange{Int}},
                                  scratch::Vector{Particles},
                                  partial::Vector{Float64}, dfun::F, N::Int,
@@ -72,7 +69,7 @@ end
                                  dz::Float64) where {F}
     s = scratch[c]
     acc = 0.0
-    # chunks are over 1:N; the C grid index i is 0-based: i = idx - 1.
+    # chunks index 1:N; the grid index i is 0-based: i = idx - 1.
     @inbounds for idx in chunks[c]
         acc += _mpart_slice(dfun, s, idx - 1, N, dx, dy, dz)
     end
@@ -83,33 +80,25 @@ end
 """
     mpart_from_integral(particles, param, problem, prob) -> Float64
 
-Port of `setup.c::mpart_from_integral`. Integrates the problem density model
-on a `N=1<<9` (512) cells-per-side midpoint grid (3D) and returns
-`M_tot / Npart`. The density callback is called with
-`density_function_correction = 0.0` to conserve the mass integral
-(CLAUDE.md §1.2; C passes `0.0` to `Density_Func_Ptr`).
+Integrate the problem density model on an `N=1<<9` (512) cells-per-side midpoint
+grid (3D) and return `M_tot / Npart`. The density callback is evaluated with
+`density_function_correction = 0.0` so the mass integral is conserved.
 
-The C code abuses `P[0].Pos` as the integration probe (the density function
-reads `P[ipart].Pos`). We replicate that exactly: a single scratch particle
-(`particles.pos[1]`) is moved over the grid and `prob.density(particles, 1,
-0.0)` evaluated. **Caveat:** this writes `particles.pos[1]`; positions are
-(re)assigned afterwards by `make_positions!`, exactly as in C where
-`Make_Positions` overwrites `P[0].Pos`. The `particles.pos[1]` slot is
-restored to its prior value on return for safety.
+The density function reads a particle's position, so a scratch `Particles(1)`
+probe is moved over the grid and `prob.density(probe, 1, 0.0)` evaluated.
 
-Parallelised by partitioning the outer (`i`) loop into `nchunks` contiguous
-index ranges (CLAUDE.md §4b: the 512³ integration is serial in C and trivially
-parallel). One scratch `Particles` probe **and** one partial-sum accumulator
-are preallocated *per chunk* and indexed by the loop's chunk variable `c`
-(never `Threads.threadid()`, which on Julia ≥1.12 with the `:dynamic`
-scheduler is not bounded by `nthreads()`). Each task owns chunk `c` and writes
-only `scratch[c]` / `partial[c]`, so the probe write is race-free. The
-midpoint sum is reproducible (per-`i` slices are accumulated in ascending `i`
-order within each chunk and the chunk partials are summed in chunk order).
+Parallelised by partitioning the outer (`i`) loop into contiguous index ranges.
+One scratch probe and one partial-sum accumulator are preallocated *per chunk*
+and indexed by the loop's chunk variable `c` (never `Threads.threadid()`, which
+on Julia ≥1.12 with the `:dynamic` scheduler is not bounded by `nthreads()`, so
+a `threadid()`-indexed buffer can go out of bounds). Each task owns chunk `c`
+and writes only `scratch[c]` / `partial[c]`, so the probe write is race-free.
+The midpoint sum is reproducible: per-`i` slices accumulate in ascending `i`
+order within each chunk and the chunk partials are summed in chunk order.
 """
 function mpart_from_integral(particles::Particles, param::Parameters,
                              problem::ProblemParameters, prob::Problem)
-    N = 1 << 9                       # 512, as C: const int N = 1ULL << 9;
+    N = 1 << 9                       # 512 cells per side
     bx = problem.Boxsize[1]
     by = problem.Boxsize[2]
     bz = problem.Boxsize[3]
@@ -134,9 +123,9 @@ function mpart_from_integral(particles::Particles, param::Parameters,
     # on its concrete type (no per-call dynamic dispatch / allocation).
     dfun = prob.density
 
-    # Swappable parallel driver (see src/parallel/threads.jl). The `do c`
-    # body is a pure function-barrier forward to `_mpart_chunk!` — no boxed
-    # capture; results are race-free per chunk. Backend-independent semantics.
+    # Parallel driver (see src/parallel/threads.jl). The `do c` body is a pure
+    # function-barrier forward to `_mpart_chunk!` — no boxed capture; results are
+    # race-free per chunk.
     _run_chunks(nc) do c
         _mpart_chunk!(c, chunks, scratch, partial, dfun, N, dx, dy, dz)
     end

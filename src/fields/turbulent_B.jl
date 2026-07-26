@@ -1,35 +1,25 @@
-# Divergence-free turbulent magnetic field generator.
+# Divergence-free turbulent magnetic field generator. Ports make_turb_B.c
+# (J. Donnert 2013). In-memory and callable both standalone and as a problem
+# `postprocess!` hook (it needs the final post-relaxation positions).
 #
-# Julia port of `make_turb_B.c` (J. Donnert 2013; CLAUDE.md §1.9). The C tool
-# is standalone (flat-binary interchange); this port is in-memory and callable
-# both standalone and as a problem `postprocess!` hook for the cluster /
-# Magneticum problems (the preferred wiring per CLAUDE.md §1.9 — it needs ALL
-# final post-relaxation positions, and `make_sph_wvtics` runs the appliers after
-# `regularise_sph_particles!`).
-#
-# Algorithm (C `make_magnetic_field`):
+# Algorithm:
 #   1. nGrid = 2*ceil(Boxsize / B_scale).
 #      Kmin = 2π / (0.01·Boxsize),  Kmax = 0.5·Kmin·nGrid  (Nyquist).
 #   2. Fill a complex k-space grid per component with a power-law spectrum
 #      P(k) = k^spectral_index, Box-Muller amplitudes sqrt(-log(U)·P(k)) and a
 #      random phase; drop |k| > Kmax; enforce Hermitian symmetry so the inverse
 #      transform is real.
-#   3. Inverse FFT -> real space; normalise to the field model (constant
-#      `B_norm` by default, the C `magnetic_field_model`).
+#   3. Inverse FFT -> real space; normalise to a constant mean field `B_norm`.
 #   4. Forward FFT; divergence clean by the projection
 #      B_k <- (I - k̂ k̂ᵀ)·B_k (Ruszkowski+ 2006 / Balsara 1996); zero DC.
 #   5. Inverse FFT -> real space; NGP-interpolate grid -> particles (periodic).
 #
-# FFT choice (CLAUDE.md §1.9 explicitly permits this): the **full complex
-# `fft`/`ifft`** path is used (not `rfft`/`irfft`) — it is the easiest
-# correctness path, the Hermitian symmetry is enforced explicitly on the full
-# cube so the inverse transform is real to round-off, and the divergence-clean
-# projection is applied to every mode. This deviates from the C `r2c`/`c2r`
-# layout but is mathematically equivalent and far less error-prone.
+# Uses the full complex `fft`/`ifft` path (not `rfft`/`irfft`): Hermitian
+# symmetry is enforced explicitly on the full cube so the inverse transform is
+# real to round-off and the projection is applied to every mode.
 #
-# RNG note (CLAUDE.md §5, as elsewhere in this port): a seeded
-# `Random.Xoshiro` is used (statistical reproducibility for a fixed seed). The
-# stream is NOT bit-identical to the C GSL RNG — by design and documented.
+# A seeded `Random.Xoshiro` is used (reproducible for a fixed seed; not
+# bit-identical to a GSL RNG stream).
 
 """
     make_turbulent_Bfield(pos, boxsize; B_norm=1e-6, B_scale=0.1,
@@ -41,14 +31,13 @@ power-law power spectrum `P(k) = k^spectral_index` (Kolmogorov default
 `-11/3`) and NGP-interpolate it to the particle positions `pos`
 (`AbstractVector{<:SVector{3}}`, the WVTICs SoA `particles.pos`).
 
-- `boxsize` — the (cubic) periodic box side length used by the C tool's
-  `Boxsize` (the grid is built on `[0, boxsize)`).
-- `B_norm` — target mean field magnitude (C `Bfld_Norm`, default `1e-6` G;
-  the constant `magnetic_field_model`).
+- `boxsize` — the (cubic) periodic box side length (the grid is built on
+  `[0, boxsize)`).
+- `B_norm` — target mean field magnitude (default `1e-6` G).
 - `B_scale` — sets the grid resolution `nGrid = 2·ceil(boxsize/B_scale)`
-  (C `Bfld_Scale`, default `0.1`).
-- `spectral_index` — power-law slope (C `SPECTRAL_INDEX`, default `-11/3`).
-- `seed` — RNG seed (statistical reproducibility; not C-bit-identical).
+  (default `0.1`).
+- `spectral_index` — power-law slope (default `-11/3`).
+- `seed` — RNG seed (reproducible for a fixed seed).
 
 Returns one `SVector{3,Float32}` per input position.
 """
@@ -84,25 +73,12 @@ function make_turbulent_Bfield(pos::AbstractVector{<:SVector{3}},
     _normalise_bfld_grid!(B, nGrid, Float64(B_norm))
 
     # (4) forward FFT, divergence clean (Balsara/Ruszkowski projection;
-    # `_divergence_clean!` also zeroes the DC mode and the Nyquist
-    # hyperplanes). `fft` of a real field is Hermitian to round-off.
+    # `_divergence_clean!` also zeroes the DC mode). `fft` of a real field is
+    # Hermitian to round-off.
     #
-    # KNOWN OPEN ISSUE (see PORT_STATUS.md "turbulent-B spectral divergence"
-    # and /e/ocean2/users/lboess/WVTICs/TURBB_ANALYSIS.md): the Phase-4
-    # spectral-∇·B test fails with a residual `max|k·B_k| ≈ 0.61·max(k|B_k|)`
-    # that is INVARIANT (to ~1e-8) across every attempted fix so far
-    # (kmult/fftfreq correction, removing the old `_hermitian_symmetrise!`,
-    # zeroing the Nyquist hyperplanes, and an index-mirror Hermitian
-    # projection — all verified inert). Orchestrator instrumentation showed
-    # the residual is present *immediately after the projector, measured with
-    # the projector's own Kx/Ky/Kz* (before any ifft/round-trip), and that at
-    # the worst mode the projector output exactly equals hand-computed
-    # `B−k̂(k̂·B)` yet `k·B≠0` — algebraically impossible for a consistent `k`,
-    # i.e. the true cause is still unexplained and upstream of the round-trip.
-    # The field is otherwise correct (real, right spectrum slope, mean |B|,
-    # NGP, postprocess wiring). The Phase-4 spectral subtest is therefore
-    # left as `@test_broken` pending a dedicated controlled single-mode
-    # investigation. The `_hermitian_project!` experiment was reverted (inert).
+    # Known limitation: the spectral div(B) test is left @test_broken (a ~0.61
+    # longitudinal residual whose cause is unresolved); the field is otherwise
+    # correct (real, right spectrum, mean |B|).
     Bk = (fft(B[1]), fft(B[2]), fft(B[3]))
     _divergence_clean!(Bk, Kx, Ky, Kz, nGrid)
 
@@ -114,30 +90,19 @@ end
 
 @inline _powerspectrum(k, idx) = k^idx
 
-# Port of make_turb_B.c::fill_fourier_grid. The C code uses an r2c half-grid
-# and hand-rolls the k=0-plane Hermitian symmetry. Here the FULL complex cube
-# is filled: for every independent mode we draw Box-Muller amplitude + random
-# phase and ALSO write the conjugate at the mirrored index (B(-k)=conj(B(k))),
-# guaranteeing a real inverse transform. The DC mode (0,0,0) and the self-
-# conjugate Nyquist modes are set real. This is the documented correctness
-# path (CLAUDE.md §1.9) and matches the C spectrum/cutoff exactly.
+# Fill the full complex k-space cube. For every independent mode draw a
+# Box-Muller amplitude + random phase and also write the conjugate at the
+# mirrored index (B(-k)=conj(B(k))), guaranteeing a real inverse transform.
 function _fill_fourier_grid!(Bk, Kx, Ky, Kz, nGrid::Int, Kmin::Float64,
                              Kmax::Float64, sidx::Float64, seed::Integer)
     rng = Random.Xoshiro(seed)
     half = nGrid ÷ 2
 
-    # Frequency index -> signed wavenumber multiple, EXACTLY the
-    # AbstractFFTs/FFTW `fftfreq(nGrid, nGrid)` convention:
-    #   0, 1, …, nGrid/2-1, -nGrid/2, …, -1   (0-based index `i`).
-    # This makes the wavevector grid *exactly antisymmetric* under the
-    # conjugate-mirror index map `i -> (nGrid-i) % nGrid` for every non
-    # self-mirror mode (`kmult((nGrid-i)%nGrid) == -kmult(i)`), which is what
-    # makes the even projector `(I - k̂k̂ᵀ)` preserve Hermitian symmetry — and
-    # therefore lets `real.(ifft(...))` keep a divergence-free field.
-    # (Bug-fix: the previous `i <= half ? i : i - nGrid` put the Nyquist index
-    # at `+nGrid/2`, breaking that antisymmetry and reintroducing divergence
-    # when `real.(ifft())` discarded the resulting non-Hermitian imaginary
-    # part — observed as the spectral ∇·B failing the Phase-4 test by ~6000×.)
+    # Frequency index -> signed wavenumber multiple, the
+    # `fftfreq(nGrid, nGrid)` convention: 0, 1, …, nGrid/2-1, -nGrid/2, …, -1
+    # (0-based index `i`). This grid is antisymmetric under the conjugate-mirror
+    # index map `i -> (nGrid-i) % nGrid`, so the projector `(I - k̂k̂ᵀ)`
+    # preserves Hermitian symmetry and `real.(ifft(...))` stays divergence-free.
     @inline kmult(i) = i < half ? i : i - nGrid
 
     @inbounds for i in 0:(nGrid - 1)
@@ -154,20 +119,10 @@ function _fill_fourier_grid!(Bk, Kx, Ky, Kz, nGrid::Int, Kmin::Float64,
                 Ky[ii, jj, kk] = kyv
                 Kz[ii, jj, kk] = kzv
 
-                # Leave the DC mode AND the Nyquist hyperplanes (index
-                # nGrid/2 on any axis) exactly zero in the fill. This is the
-                # Toycluster-comparison fix (TURBB_TOYCLUSTER_COMPARISON.md,
-                # H1): the C r2c half-grid implicitly omits the signed Nyquist
-                # plane, so its divergence-clean operates on a sub-lattice
-                # exactly closed under the conjugate index mirror. Populating
-                # the Nyquist planes here and zeroing them post-projector (the
-                # old approach) tampered the spectrum so `Bk_cleaned` was not a
-                # fixed point of `fft∘real∘ifft`, re-expressing a fixed ~0.61
-                # longitudinal residual (the bit-identical @test_broken across
-                # all prior attempts). Never populating them removes the
-                # tampering at the source; no physics change (DC carries zero
-                # mean; the post-hoc-discarded Nyquist plane carried no kept
-                # power). The K stores above are still recorded for every cell.
+                # The DC mode and the Nyquist hyperplanes (index nGrid/2 on any
+                # axis) are left zero so the populated sub-lattice is closed
+                # under the conjugate index mirror, keeping the field real after
+                # ifft. The K stores above are still recorded for every cell.
                 (i == 0 && j == 0 && k == 0) && continue
                 (i == half || j == half || k == half) && continue
 
@@ -207,8 +162,7 @@ function _fill_fourier_grid!(Bk, Kx, Ky, Kz, nGrid::Int, Kmin::Float64,
     return nothing
 end
 
-# gsl_rng_uniform_pos analogue: a uniform in (0,1) (strictly positive, so
-# log() is finite).
+# Uniform draw in (0,1), strictly positive so log() is finite.
 @inline function _rand_pos(rng)
     u = rand(rng)
     while u <= 0.0
@@ -217,12 +171,8 @@ end
     return u
 end
 
-# Port of make_turb_B.c::normalise_bfld_grid. The C code computes the global
-# mean of |B| over the (half) grid, divides by it and by the FFTW
-# normalisation (nGrid^3), then scales every cell by
-# magnetic_field_model(x,y,z) = B_norm (constant). With Julia's `ifft`
-# (already 1/N-normalised) the FFTW nGrid^3 factor is NOT needed; dividing by
-# the global mean and multiplying by B_norm makes the mean |B| == B_norm.
+# Scale the real-space field so its global mean |B| equals B_norm: divide
+# every cell by the mean |B| and multiply by B_norm.
 function _normalise_bfld_grid!(B, nGrid::Int, B_norm::Float64)
     n3 = nGrid * nGrid * nGrid
     s = 0.0
@@ -240,9 +190,9 @@ function _normalise_bfld_grid!(B, nGrid::Int, B_norm::Float64)
     return nothing
 end
 
-# Port of make_turb_B.c::divergence_clean_fourier_grid (Balsara 1996 /
-# Ruszkowski+ 2006): project out the longitudinal part of each k-mode,
-# B_k <- (I - k̂ k̂ᵀ)·B_k, then zero the DC mode.
+# Divergence clean (Balsara 1996 / Ruszkowski+ 2006): project out the
+# longitudinal part of each k-mode, B_k <- (I - k̂ k̂ᵀ)·B_k, then zero the DC
+# mode.
 function _divergence_clean!(Bk, Kx, Ky, Kz, nGrid::Int)
     n3 = nGrid * nGrid * nGrid
     @inbounds for idx in 1:n3
@@ -261,50 +211,21 @@ function _divergence_clean!(Bk, Kx, Ky, Kz, nGrid::Int)
                      bz * kx * kz * k2inv
         Bk[2][idx] = -bx * ky * kx * k2inv + by * (1.0 - ky * ky * k2inv) -
                      bz * ky * kz * k2inv
-        # NOTE: the `+ bz*(1 - kz²/k²)` sign here is a deliberate CORRECTION
-        # of a latent bug in the C `make_turb_B.c` (and the earlier port),
-        # whose third projector row read `- Bz*(1-kz*kz*k2inv)`. The
-        # projection operator `(I - k̂k̂ᵀ)` row 3 is unambiguously
-        # `B'_z = -bx·kzkx/k² - by·kzky/k² + bz·(1 - kz²/k²)` (rows 1,2 in the
-        # C are already the correct `+bx·(1-kx²/k²)` / `+by·(1-ky²/k²)`
-        # form). The wrong sign left the field longitudinal in z, the true
-        # root cause of the long-standing spectral-∇·B `@test_broken`
-        # (residual ≈0.5-0.61 invariant across all Hermitian/Nyquist/layout
-        # fixes, none of which touched this term). See
-        # TURBB_TOYCLUSTER_COMPARISON.md / TURBB_ANALYSIS.md.
+        # Row 3 uses +bz*(1 - kz^2/k^2); the projector (I - k-hat k-hat^T)
+        # requires the + sign (the C source's -bz sign is wrong).
         Bk[3][idx] = -bx * kz * kx * k2inv - by * kz * ky * k2inv +
                      bz * (1.0 - kz * kz * k2inv)
     end
-    # zero the DC mode (C: Bk[*][0] = 0). Julia index 1 == grid (0,0,0).
+    # zero the DC mode; Julia index 1 == grid (0,0,0).
     Bk[1][1] = 0.0 + 0.0im
     Bk[2][1] = 0.0 + 0.0im
     Bk[3][1] = 0.0 + 0.0im
-    # NOTE: the post-projector Nyquist-hyperplane zeroing that used to live
-    # here was REMOVED (TURBB_TOYCLUSTER_COMPARISON.md, H1 fix, Change B).
-    # The DC + Nyquist planes are now never populated in `_fill_fourier_grid!`
-    # (Change A), so they carry no power through `fft(B)` here and need no
-    # post-hoc tampering. Tampering the full cube post-projector made
-    # `Bk_cleaned` not a fixed point of `fft∘real∘ifft` and re-expressed a
-    # fixed ~0.61 longitudinal residual. With the populated sub-lattice now
-    # exactly closed under the conjugate index mirror (kmult(mirror) =
-    # -kmult(idx) everywhere it is nonzero), the cleaned spectrum is a fixed
-    # point and the projector's per-mode k·B≡0 survives to round-off.
     return nothing
 end
 
-# NOTE: an experimental `_hermitian_project!` step (index-mirror conjugate
-# averaging of the cleaned spectrum) was added and then REVERTED — orchestrator
-# verification showed it inert (the spectral-∇·B residual stayed bit-identical
-# at `max|k·B_k| ≈ 0.61·max(k|B_k|)`), like the three prior attempts. The
-# spectral-divergence defect is a documented KNOWN OPEN ISSUE (`@test_broken`;
-# see PORT_STATUS.md and /e/ocean2/users/lboess/WVTICs/TURBB_ANALYSIS.md) whose
-# true cause is still unexplained (the residual is present immediately after
-# the projector, measured with its own K, before any round-trip). No
-# Hermitian-projection step is applied.
-
-# Port of make_turb_B.c::grid2particles_NGP (Hockney & Eastwood). The C grid
-# spans [0, Boxsize); positions are wrapped periodically into [0, nGrid) then
-# floored (nearest grid point). Julia arrays are 1-based so add 1 to indices.
+# NGP interpolation (Hockney & Eastwood): positions are wrapped periodically
+# into [0, nGrid) then floored to the nearest grid point. Julia arrays are
+# 1-based so add 1 to indices.
 function _grid2particles_ngp(B, pos::AbstractVector{<:SVector{3}}, L::Float64,
                              nGrid::Int)
     cell = L / nGrid
@@ -344,13 +265,11 @@ Build a problem `postprocess!` callback `(particles, param, problem) ->
 nothing` that fills `particles.bfld` with a divergence-free turbulent field
 ([`make_turbulent_Bfield`](@ref)) over the final post-relaxation positions.
 
-Wired into the **galaxy_cluster (4.12)** and **magneticum (2.0)** problems
-(CLAUDE.md §1.9): `make_sph_wvtics` calls `make_post_processing!` after
-`regularise_sph_particles!`, so all particle positions are final when this
-runs. `B_scale` defaults to `boxsize/16` (a reasonable turbulent injection
-scale that keeps the grid modest); pass it explicitly to override. The box is
-taken as the largest axis (`Boxsize[1]`, the C-invariant largest dimension);
-the field is generated on a cubic `[0, boxsize)` grid as in the C tool.
+Runs after `regularise_sph_particles!`, so all particle positions are final.
+`B_scale` defaults to `boxsize/16` (a reasonable turbulent injection scale that
+keeps the grid modest); pass it explicitly to override. The box is taken as the
+largest axis (`Boxsize[1]`); the field is generated on a cubic `[0, boxsize)`
+grid.
 """
 function make_turbulent_postprocess(; B_norm::Real = 1e-6,
                                       B_scale::Union{Nothing,Real} = nothing,
@@ -360,7 +279,7 @@ function make_turbulent_postprocess(; B_norm::Real = 1e-6,
                      problem::ProblemParameters)
         n = param.Npart
         n == 0 && return nothing
-        L = problem.Boxsize[1]                 # largest axis (invariant)
+        L = problem.Boxsize[1]                 # largest axis
         bs = B_scale === nothing ? L / 16.0 : float(B_scale)
         b = make_turbulent_Bfield(particles.pos, L;
                                   B_norm = B_norm, B_scale = bs,

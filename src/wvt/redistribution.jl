@@ -1,33 +1,24 @@
-# Phase 3 — Metropolis-style particle redistribution.  Ports `redistribution.c`
-# (+ `redistribution.h`) per CLAUDE.md §1.4 step 2.
+# Metropolis-style particle redistribution.
 #
-# Algorithm (faithful to the C):
-#   * pick a random *untouched* (`!Redistributed`) particle whose density is
+# Algorithm:
+#   * pick a random untouched (`!redistributed`) particle whose density is
 #     above the model (high-energy state); accept it for movement with
-#     probability `erf(relErrSigned)` (`acceptParticleForMovement`);
-#   * pick a random untouched *underdense* particle as a target, accepted with
-#     probability `-relErrSigned` (`acceptParticleAsTarget`);
+#     probability `erf(relErrSigned)`;
+#   * pick a random untouched underdense particle as a target, accepted with
+#     probability `-relErrSigned`;
 #   * move the chosen particle to within `0.3·Hsml` of the target, per-axis,
 #     re-drawing until the coordinate is in `[0, Boxsize)` (periodic axes wrap;
-#     non-periodic axes simply reject-and-redraw) — `getPositionInProximity`;
-#   * mark the moved particle `Redistributed = true`;
-#   * stop once `movePart` particles are moved OR `maxProbes` probes are spent.
-#   `relativeDensityErrorWithSign(i) = (Rho - rhoModel) / rhoModel`,
-#   `rhoModel = Density_Func_Ptr(i, density_function_correction)`
-#   (C `Param.BiasCorrection`).
+#     non-periodic axes reject-and-redraw);
+#   * mark the moved particle `redistributed = true`;
+#   * stop once `move_part` particles are moved OR `max_probes` probes are spent.
+#   `relErrSigned(i) = (Rho - rhoModel) / rhoModel`,
+#   `rhoModel = prob.density(i, density_function_correction)`.
 #
-# Concurrency model (documented deviation, see PORT_STATUS.md):
-# the C uses OpenMP with a `#pragma omp critical`/`atomic`-guarded shared
-# `probeCounter` and `Redistributed` flag.  That shared mutable state under a
-# critical section makes the C effectively serialise the *selection*; the only
-# parallel work is the (cheap) accept-predicate evaluation.  We implement the
-# selection **serially** with a single per-call `Xoshiro` RNG (the established
-# `positions.jl` per-chunk RNG pattern, base seed `14041981`).  This is
-# materially simpler, race-free by construction, and statistically equivalent:
-# the Metropolis structure, the `erf`/`-relErr` accept probabilities, the
-# `0.3·Hsml` proximity move, the `probeCounter`/`movePart` bounds, and the
-# `Redistributed` exclusivity are all preserved exactly.  RNG bit-equivalence
-# to C `erand48` was never a goal (CLAUDE.md §5).
+# Selection is serial with a single per-call `Xoshiro` RNG (base seed
+# `14041981`): race-free and statistically equivalent to a parallel selection.
+# The Metropolis structure, the `erf`/`-relErr` accept probabilities, the
+# `0.3·Hsml` proximity move, the probe/move bounds, and the `redistributed`
+# exclusivity are all preserved.
 
 using Random
 
@@ -48,11 +39,9 @@ end
     relative_density_error_signed(particles, prob, ipart,
                                   density_function_correction) -> Float64
 
-Port of `redistribution.c::relativeDensityErrorWithSign`:
-`(Rho - rhoModel) / rhoModel` with
-`rhoModel = prob.density(particles, ipart, density_function_correction)`
-(`density_function_correction = param.density_function_correction`, C
-`Param.BiasCorrection`).  Ranges from −1 (ρ=0) to +∞ (ρ→∞).
+Signed relative density error `(Rho - rhoModel) / rhoModel` with
+`rhoModel = prob.density(particles, ipart, density_function_correction)`.
+Ranges from −1 (ρ=0) to +∞ (ρ→∞).
 """
 # Inner form taking the density callback as `dfun::F`, so hot callers (the
 # redistribution probe loops) specialise on its concrete type instead of
@@ -73,8 +62,8 @@ end
     relative_density_error(particles, prob, ipart,
                            density_function_correction) -> Float64
 
-Port of `redistribution.c::relativeDensityError`: the absolute value of
-[`relative_density_error_signed`](@ref).  Used by the WVT loop's error stats.
+Absolute value of [`relative_density_error_signed`](@ref).  Used by the WVT
+loop's error stats.
 """
 @inline function relative_density_error(particles::Particles, prob::Problem,
                                          ipart::Int,
@@ -86,22 +75,20 @@ end
 """
     reset_redistribution_flags!(particles)
 
-Port of `redistribution.c::resetRedistributionFlags`: clear every
-`particles.redistributed[i]` to `false`.
+Clear every `particles.redistributed[i]` to `false`.
 """
 function reset_redistribution_flags!(particles::Particles)
     fill!(particles.redistributed, false)
     return nothing
 end
 
-# C `randomParticle()` = `erand48 * Npart` → 0-based index in [0,Npart).
-# Here 1-based: `floor(rand()*N) + 1`, clamped (rand can be 1.0-ε but never 1).
+# Random 1-based particle index in [1, N]: `floor(rand()*N) + 1`, clamped
+# (rand can be 1.0-ε but never 1).
 @inline _random_particle(rng, n::Int) = min(n, floor(Int, rand(rng) * n) + 1)
 
-# Port of `getPositionInProximity(jpart, axis)` — draw a coordinate within
-# ±0.3·Hsml of particle `jpart` along `axis`, re-drawing until it lands in
-# [0, Boxsize); periodic axes wrap a single out-of-range step (matching the C
-# `if (ret >= L) ret -= L; else if (ret < 0) ret += L;`).
+# Draw a coordinate within ±0.3·Hsml of particle `jpart` along `axis`,
+# re-drawing until it lands in [0, Boxsize); periodic axes wrap a single
+# out-of-range step (if ret >= L, ret -= L; else if ret < 0, ret += L).
 @inline function _position_in_proximity(rng, particles::Particles,
                                          jpart::Int, axis::Int,
                                          boxsize::NTuple{3,Float64},
@@ -111,8 +98,8 @@ end
     base = particles.pos[jpart][axis]
     h = 0.3 * Float64(particles.hsml[jpart])
     ret = -1.0
-    # bounded loop: degenerate Hsml=0 would loop forever in C too; cap and
-    # fall back to the target's own (in-box) coordinate.
+    # bounded loop: degenerate Hsml=0 would loop forever; cap and fall back to
+    # the target's own (in-box) coordinate.
     for _ in 1:1024
         ret = base + (2.0 * rand(rng) - 1.0) * h
         if per
@@ -133,17 +120,15 @@ end
     redistribute_particles!(particles, param, problem, prob, move_part,
                             max_probes; seed = RNG_BASE_SEED) -> (moved, probes)
 
-Port of `redistribution.c::redistributeParticles` (+ its helpers).  Performs
-the Metropolis redistribution: up to `move_part` overdense untouched particles
-are accepted (prob `erf(relErr)`) and relocated to within `0.3·Hsml` of a
-randomly chosen underdense untouched particle, bounded by `max_probes` probes.
-Mutates `particles.pos` and `particles.redistributed`.  Returns
-`(n_redistributed, n_probes)` (the two C `printf` counters).
+Performs the Metropolis redistribution: up to `move_part` overdense untouched
+particles are accepted (prob `erf(relErr)`) and relocated to within `0.3·Hsml`
+of a randomly chosen underdense untouched particle, bounded by `max_probes`
+probes.  Mutates `particles.pos` and `particles.redistributed`.  Returns
+`(n_redistributed, n_probes)`.
 
-Serial selection with one `Xoshiro(seed)` RNG — see the concurrency-model
-note at the top of this file.  Density/`rho` are *not* recomputed during the
-process (the C explicitly relies on the moves being a small fraction); the
-caller re-runs `find_sph_quantities!` afterwards exactly as `wvt_relax.c` does.
+Serial selection with one `Xoshiro(seed)` RNG — see the note at the top of
+this file.  Density/`rho` are not recomputed during the process (the moves are
+a small fraction); the caller re-runs `find_sph_quantities!` afterwards.
 """
 function redistribute_particles!(particles::Particles, param::Parameters,
                                  problem::ProblemParameters, prob::Problem,
@@ -169,12 +154,12 @@ end
     redist = 0
     probes = 0
 
-    # C: `for (i=0; i<movePart; ++i)` with a shared probe budget.
+    # attempt up to move_part moves, sharing the probe budget.
     for _ in 1:move_part
         probes >= max_probes && break
 
-        # findParticleToRedistribute: random untouched particle, accepted with
-        # prob erf(relErrSigned); each *accept test* consumes a probe.
+        # pick a particle to redistribute: random untouched particle, accepted
+        # with prob erf(relErrSigned); each accept test consumes a probe.
         ipart = -1
         while true
             cand = _random_particle(rng, n)
@@ -188,18 +173,17 @@ end
             probes += 1
             if rand(rng) < _erf(_rel_density_error_signed(particles, dfun,
                                               cand, density_function_correction))
-                # acceptParticleForMovement passed: claim it (it is still
-                # untouched — serial selection guarantees no race here).
+                # accepted for movement: claim it.
                 particles.redistributed[cand] = true
                 ipart = cand
                 break
             end
-            # rejected: redraw (C `continue`s the while loop)
+            # rejected: redraw
         end
         ipart < 0 && break
 
-        # findParticleAsTargetLocation: random untouched particle accepted
-        # with prob (-relErrSigned) (i.e. underdense). Unbounded in C.
+        # pick a target location: random untouched particle accepted with
+        # prob (-relErrSigned) (i.e. underdense).
         jpart = _random_particle(rng, n)
         guard = 0
         while particles.redistributed[jpart] ||
@@ -210,7 +194,7 @@ end
             guard > 64 * n && break   # safety: no acceptable target exists
         end
 
-        # moveParticleInNeighborhoodOf
+        # move the particle into the target's neighbourhood
         px = _position_in_proximity(rng, particles, jpart, 1, box, per)
         py = _position_in_proximity(rng, particles, jpart, 2, box, per)
         pz = _position_in_proximity(rng, particles, jpart, 3, box, per)

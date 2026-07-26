@@ -1,57 +1,37 @@
-# Problem registry — Julia port of the C `setup.c::setup_problem` switch and
-# the per-problem `setup_*` / `*_Density` / `*_U` / `*_Velocity` /
-# `*_Magnetic_Field` / `*_PostProcessing` functions in `src/problems/*.c`.
+# Problem registry: each test setup is a `Problem` struct holding the
+# density / internal-energy / velocity / B-field / post-processing callbacks
+# plus the geometry it imposes on the `ProblemParameters`. A
+# `Dict{Tuple{Int,Int}, Function}` keyed by `(Problem_Flag, Problem_Subflag)`
+# maps to the per-problem constructor, matching the `ics.par` header table.
 #
-# C uses five global function pointers chosen per problem
-# (`Density_Func_Ptr`, `U_Func_Ptr`, `Velocity_Func_Ptr`,
-# `Magnetic_Field_Func_Ptr`, `PostProcessing_Func_Ptr`). Here a problem is a
-# `Problem` struct holding callbacks plus the geometry it imposes on the
-# `ProblemParameters`. A `Dict{Tuple{Int,Int}, Function}` keyed by
-# `(Problem_Flag, Problem_Subflag)` mirrors the C switch
-# (`setup.c::setup_problem`) and the `ics.par` header table.
-#
-# Phase 1 ported (0,0) constant density + (4,2) Kelvin-Helmholtz and the
-# `Problem`/`PROBLEM_REGISTRY` machinery. Phase 4 extends the registry with
-# the full working / science-relevant set and registers the `ics.par`-flagged
-# "not working"/"not implemented" problems as explicit errors (so the dispatch
-# is complete but a wrong IC is never silently shipped).
-#
-# Conventions / deviations (see PORT_STATUS.md "Phase 4"):
-# - C `Problem.Boxsize[0]` is Julia `boxsize[1]` (axis 0 = largest invariant,
-#   asserted in `setup`); C `P[ipart].Pos[d]` is `particles.pos[ipart][d]`.
-# - The C `bias` density correction (`ret += (ret-RHO_MEAN)*bias`) — an
-#   artificial density-model correction compensating imperfect WVT convergence
-#   — is ported verbatim for the problems that implement it (tophat/sawtooth/
-#   sine/gradient/linear-alfven). It is renamed `density_function_correction`
-#   (C `Param.BiasCorrection`). `setup`/`mpart_from_integral` pass
-#   `density_function_correction=0.0`; the WVT / relaxation path passes
-#   `param.density_function_correction` — handled by the callers.
-# - U callbacks that read C `SphP[ipart].Rho` read `particles.rho[ipart]`
-#   (post-relaxation density; the appliers run after `regularise_sph_particles!`
-#   exactly as the C `Make_*` appliers run after the relaxation loop).
-# - The PNG path (problem 2.1) is intentionally OUT OF SCOPE; it is registered
-#   to a clear "PNG out of scope" error, never silently wrong.
+# Conventions:
+# - `boxsize[1]` (axis 1) is the largest invariant, asserted in `setup`.
+# - `density_function_correction` is an artificial density-model correction
+#   compensating imperfect WVT convergence
+#   (`ret += (ret-RHO_MEAN)*density_function_correction`), applied by the
+#   tophat/sawtooth/sine/linear-alfven problems. `setup`/`mpart_from_integral`
+#   pass 0.0; the WVT / relaxation path passes `param.density_function_correction`.
+# - U callbacks read `particles.rho[ipart]` (post-relaxation density); the
+#   appliers run after `regularise_sph_particles!`.
+# - The PNG path (problem 2.1) is out of scope and registered to an error.
 
 """
     Problem
 
-Per-problem definition. Replaces the five C global function pointers and the
-geometry the C `setup_*` routine writes into `Problem` (`globals.h`).
+Per-problem definition: the physics callbacks plus the geometry the setup
+imposes.
 
-Callback signatures (mirroring the C function pointers, `globals.h`):
+Callback signatures:
 
-- `density(particles, ipart, density_function_correction) -> Float64`  (`Density_Func_Ptr`)
-- `internal_energy(particles, ipart) -> Float64`          (`U_Func_Ptr`)
-- `velocity(particles, ipart) -> SVector{3,Float64}`      (`Velocity_Func_Ptr`)
-- `bfield(particles, ipart) -> SVector{3,Float64}`        (`Magnetic_Field_Func_Ptr`)
-- `postprocess!(particles, param, problem) -> nothing`    (`PostProcessing_Func_Ptr`)
+- `density(particles, ipart, density_function_correction) -> Float64`
+- `internal_energy(particles, ipart) -> Float64`
+- `velocity(particles, ipart) -> SVector{3,Float64}`
+- `bfield(particles, ipart) -> SVector{3,Float64}`
+- `postprocess!(particles, param, problem) -> nothing`
 
-`density` is passed the `ipart` index and the *current* particle position is
-read from `particles.pos[ipart]` — this matches the C convention where the
-density function reads `P[ipart].Pos` (and `mpart_from_integral` abuses
-`P[0].Pos` as a scratch probe; see `mpart_from_integral` in `setup.jl`).
-
-The zero callbacks reproduce `setup.c::zero_function*`.
+`density` is passed the `ipart` index and reads the *current* particle
+position from `particles.pos[ipart]` (`mpart_from_integral` uses `pos[1]` as a
+scratch probe; see `mpart_from_integral` in `setup.jl`).
 """
 struct Problem
     name::String
@@ -65,30 +45,28 @@ struct Problem
     postprocess!::Function
 end
 
-# --- zero callbacks (setup.c::zero_function*) ------------------------------
+# --- zero callbacks --------------------------------------------------------
 
 zero_density(particles, ipart, density_function_correction)::Float64 = 0.0
 zero_U(particles, ipart)::Float64 = 0.0
 zero_vec(particles, ipart) = zero(SVector{3,Float64})
 zero_postprocess!(particles, param, problem) = nothing
 
-# C macros (macro.h): p2(a)=a*a, p3(a)=a*a*a. pi = M_PI, sqrt2 = M_SQRT2.
+# helpers: squares/cubes and common constants
 @inline _p2(a) = a * a
 @inline _p3(a) = a * a * a
 const _SQRT2 = sqrt(2.0)
 const _SQRT4PI = sqrt(4.0 * pi)     # MHD field normalisation (Gaussian units)
 const GAMMA = 5.0 / 3.0             # adiabatic index for the ideal-gas problems
 
-# --- Problem 0.0 : Constant Density (problems/constant_density.c) ----------
+# --- Problem 0.0 : Constant Density ---------------------------------------
 
 constant_density(particles, ipart, density_function_correction)::Float64 = 1.0
 
 """
     setup_constant_density(param) -> Problem
 
-Port of `setup_Constant_Density()` (`problems/constant_density.c`). Unit box,
-periodic, uniform density 1.0. `Rho_Max` left at the C `setup_problem`
-default of 1.0 (constant_density.c does not set it).
+Unit box, periodic, uniform density 1.0, `Rho_Max = 1.0`.
 """
 function setup_constant_density(param::Parameters)
     return Problem(
@@ -104,9 +82,9 @@ function setup_constant_density(param::Parameters)
     )
 end
 
-# --- Problem 0.1 : Top-Hat density (problems/tophat.c) ---------------------
+# --- Problem 0.1 : Top-Hat density ----------------------------------------
 
-# tophat.c: #define DENSITY_STEP 0.5, RHO_MEAN 1.0
+# density step 0.5 about mean 1.0
 @inline function _tophat_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     x = particles.pos[ipart][1]
     halfstep = 0.5
@@ -128,9 +106,8 @@ end
 """
     setup_tophat(param) -> Problem
 
-Port of `setup_TopHat_Density()` (`problems/tophat.c`). Box 1 x 0.5 x 0.1,
-periodic, `Rho_Max = 1.5`. Implements the artificial
-`density_function_correction` term (C `bias` density correction).
+Box 1 x 0.5 x 0.1, periodic, `Rho_Max = 1.5`. Applies the
+`density_function_correction` term.
 """
 function setup_tophat(param::Parameters)
     return Problem(
@@ -146,7 +123,7 @@ function setup_tophat(param::Parameters)
     )
 end
 
-# --- Problem 0.2 : Sawtooth density (problems/sawtooth.c) ------------------
+# --- Problem 0.2 : Sawtooth density ---------------------------------------
 
 @inline function _sawtooth_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     x = particles.pos[ipart][1]
@@ -164,9 +141,8 @@ end
 """
     setup_sawtooth(param) -> Problem
 
-Port of `setup_Sawtooth_Density()` (`problems/sawtooth.c`). Box 1 x 0.1 x 0.1,
-periodic, `Rho_Max = 1.5`. Implements the artificial
-`density_function_correction` term (C `bias` density correction).
+Box 1 x 0.1 x 0.1, periodic, `Rho_Max = 1.5`. Applies the
+`density_function_correction` term.
 """
 function setup_sawtooth(param::Parameters)
     return Problem(
@@ -182,9 +158,9 @@ function setup_sawtooth(param::Parameters)
     )
 end
 
-# --- Problem 0.3 : Sine wave density (problems/sinewave.c) -----------------
+# --- Problem 0.3 : Sine wave density --------------------------------------
 
-# sinewave.c: #define ORDER 1, RHO_MEAN 1.0
+# one full wave about mean 1.0
 @inline function _sinewave_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     x = particles.pos[ipart][1]
     ret = 1.0 + 0.5 * sin(2.0 * pi * x)
@@ -195,9 +171,8 @@ end
 """
     setup_sinewave(param) -> Problem
 
-Port of `setup_SineWave_Density()` (`problems/sinewave.c`). Box 1 x 0.75 x
-0.75, periodic, `Rho_Max = 1.5`. Implements the artificial
-`density_function_correction` term (C `bias` density correction).
+Box 1 x 0.75 x 0.75, periodic, `Rho_Max = 1.5`. Applies the
+`density_function_correction` term.
 """
 function setup_sinewave(param::Parameters)
     return Problem(
@@ -213,11 +188,9 @@ function setup_sinewave(param::Parameters)
     )
 end
 
-# --- Problem 1.0 : Gradient density (problems/gradient.c) -----------------
+# --- Problem 1.0 : Gradient density ---------------------------------------
 
-# gradient.c does NOT set Boxsize/Rho_Max -> C defaults (1x1x1, Rho_Max 1.0,
-# periodic). Note: gradient.c does NOT apply the density_function_correction
-# (C `bias`) term.
+# defaults: 1x1x1 box, periodic, Rho_Max 1.0; no density_function_correction
 @inline function _gradient_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     x = particles.pos[ipart][1]
     halfstep = 0.5
@@ -234,10 +207,8 @@ end
 """
     setup_gradient(param) -> Problem
 
-Port of `setup_Gradient_Density()` (`problems/gradient.c`). The C function
-does not set the box / `Rho_Max`, so the `setup_problem` defaults apply
-(1 x 1 x 1, periodic, `Rho_Max = 1.0`). No `density_function_correction`
-(C `bias`) term in the C source.
+Box 1 x 1 x 1, periodic, `Rho_Max = 1.0`. No `density_function_correction`
+term.
 """
 function setup_gradient(param::Parameters)
     return Problem(
@@ -253,10 +224,9 @@ function setup_gradient(param::Parameters)
     )
 end
 
-# --- Problem 2.0 : Magneticum logo (problems/magneticum.c) ----------------
+# --- Problem 2.0 : Magneticum logo ----------------------------------------
 
-# Faithful port of Magneticum_Density. BOUNDARY=0, ACTUALREGION=1,
-# DENSITY_CONTRAST=16. Box 1 x 1 x 0.5. C does not set Rho_Max -> default 1.0.
+# "MAGNETICUM" logo density mask, contrast 16. Box 1 x 1 x 0.5, Rho_Max 1.0.
 @inline function _magneticum_density(particles::Particles, ipart::Int, density_function_correction)::Float64
     p = particles.pos[ipart]
     bx = 1.0; by = 1.0; bz = 0.5
@@ -319,10 +289,8 @@ end
 """
     setup_magneticum(param) -> Problem
 
-Port of `setup_Magneticum_Density()` (`problems/magneticum.c`). Box
-1 x 1 x 0.5, periodic, `Rho_Max = 1.0` (C default — magneticum.c does not set
-it). The "MAGNETICUM" logo density mask; turbulent-B wired via
-`postprocess!` (see `make_turbulent_postprocess`).
+Box 1 x 1 x 0.5, periodic, `Rho_Max = 1.0`. The "MAGNETICUM" logo density
+mask; turbulent B set via `postprocess!` (see `make_turbulent_postprocess`).
 """
 function setup_magneticum(param::Parameters)
     return Problem(
@@ -341,14 +309,12 @@ end
 # --- Problem 2.1 : PNG logo — OUT OF SCOPE --------------------------------
 
 function setup_png(param::Parameters)
-    error("problem 2.1 (PNG logo / setup_Png_Density) is intentionally " *
-          "OUT OF SCOPE for this port (PNG path skipped per CLAUDE.md " *
-          "scope decision); not ported.")
+    error("problem 2.1 (PNG logo) is out of scope for this port; not ported.")
 end
 
-# --- Problem 3.x : Double Shock (problems/doubleshock.c) -------------------
+# --- Problem 3.x : Double Shock --------------------------------------------
 
-# doubleshock.c parameter table Params[subflag] = {cs[0] km/s, Mach[0], Velx[2]}
+# per-subflag parameters: {upstream cs [km/s], Mach, downstream Velx}
 const _DS_PARAMS = ((850.0, 2.0, 1.6 * 2000.0),
                     (850.0, 3.0, 2.4 * 2000.0),
                     (850.0, 4.0, 2.9 * 2000.0))
@@ -359,7 +325,7 @@ const _DS_PARAMS = ((850.0, 2.0, 1.6 * 2000.0),
 @inline _ds_pressure(M, gamma) =
     2.0 * gamma / (gamma + 1.0) * M * M - (gamma - 1.0) / (gamma + 1.0)
 
-# bisection (Press+ 1992), verbatim from doubleshock.c::find_M1
+# bisection (Press+ 1992) for the second-shock Mach number
 function _ds_find_M1(cs_up, v_dw, gamma)
     left = 1.0
     right = 100.0
@@ -381,11 +347,11 @@ function _ds_find_M1(cs_up, v_dw, gamma)
 end
 
 # Returns (Rho::NTuple{3}, U::NTuple{3}, Velx::NTuple{3}) — the converged
-# shock-tube state, port of doubleshock.c::set_shock_tube + setup body.
+# three-region shock-tube state.
 function _ds_state(subflag::Int)
     gamma = GAMMA
     cs0, mach0, velx2 = _DS_PARAMS[subflag + 1]
-    # Rho[0] = 1e-28 * (ULength^3 / UMass); ULength/UMass = std Gadget units.
+    # Rho[0] = 1e-28 g/cm^3 in standard Gadget units
     ULength = 3.08568025e21
     UMass = 1.989e43
     rho0 = 1e-28 * (_p3(ULength) / UMass)
@@ -422,11 +388,9 @@ end
 """
     setup_double_shock(subflag) -> (param -> Problem)
 
-Port of `setup_Double_Shock(subflag)` (`problems/doubleshock.c`). Box
-2000 x 200 x 100, periodic, three regions split at `XBoxhalf` and
+Box 2000 x 200 x 100, periodic, three regions split at `XBoxhalf` and
 `1.5*XBoxhalf`. `subflag` selects the Mach number (0: Mach 2, 1: Mach 3,
-2: Mach 4). `Rho_Max = Rho[2]*1.1` (the C code overwrites the
-Mpart-dependent initial estimate with this after `set_shock_tube`).
+2: Mach 4). `Rho_Max = Rho[3]*1.1`.
 """
 function setup_double_shock(subflag::Int)
     return function (param::Parameters)
@@ -478,7 +442,7 @@ function setup_double_shock(subflag::Int)
     end
 end
 
-# --- Problem 4.0 : Sod Shock (problems/sodshock.c) -------------------------
+# --- Problem 4.0 : Sod Shock ----------------------------------------------
 
 function setup_sod_shock(param::Parameters)
     bx = 140.0
@@ -508,7 +472,7 @@ function setup_sod_shock(param::Parameters)
     )
 end
 
-# --- Problem 4.1 : Sedov Blast (problems/sedov.c) -------------------------
+# --- Problem 4.1 : Sedov Blast --------------------------------------------
 
 const _SEDOV_RHO = 1.24e7
 const _SEDOV_NNPART = 296
@@ -517,30 +481,14 @@ const _SEDOV_U_SN = 0.00502765   # 1e51 erg per unit mass, Gadget units
 _sedov_density(particles, ipart, density_function_correction)::Float64 = _SEDOV_RHO
 _sedov_U(particles, ipart)::Float64 = 0.0
 
-# Port of Sedov_Blast_abs() (`problems/sedov.c`): the Euclidean distance from
-# each particle to the box centre; returns the distance to the `NNpart`-th
-# nearest particle (the radius enclosing the SN-energy core).
-#
-# DELIBERATE BUG-FIX DEVIATION (project rule, cf. the redistribution NaN→Int
-# guard): the C `Sedov_Blast_abs` (sedov.c:40) has a typo in the y-term —
-# it reads
-#     ( P[i].Pos[1] * 0.5 * Problem.Boxsize[1] ) * ( P[i].Pos[1] - 0.5 * Box[1] )
-# i.e. the first factor uses `*` where, to match the (correct) x- and z-terms
-# `(Pos - 0.5*Box)^2`, it must be `-`. With the typo the y-term is
-# `(½·y·By)·(y − ½·By)`, which is negative for a large range of y and makes the
-# sum under `sqrt` negative: C silently yields NaN (corrupting the IC), Julia
-# would throw a DomainError. `Sedov_Blast_PostProcessing` itself already uses
-# the correct centred radius `sqrt(x²+y²+z²)`, confirming the intended quantity
-# is the centred Euclidean distance. We therefore implement the intended,
-# physically-correct centred squared distance for every axis (so the quantity
-# under `sqrt` is a sum of squares and is always ≥ 0; no DomainError is
-# reachable).
+# Centred Euclidean distance of each particle to the box centre; returns the
+# distance to the `NNpart`-th nearest particle (the radius enclosing the
+# SN-energy core). Uses a centred squared distance on every axis (the C
+# y-term sign typo is fixed here, so the sum under `sqrt` is always ≥ 0).
 function _sedov_abs_maxdist(particles::Particles, bx, by, bz, npart::Int)
     rs = Vector{Float64}(undef, npart)
     @inbounds for i in 1:npart
         p = particles.pos[i]
-        # corrected centred squared distance (the C y-term `*`→`-` typo fixed,
-        # sedov.c:40); sum of squares is always non-negative.
         rx = (p[1] - 0.5 * bx) * (p[1] - 0.5 * bx)
         ry = (p[2] - 0.5 * by) * (p[2] - 0.5 * by)
         rz = (p[3] - 0.5 * bz) * (p[3] - 0.5 * bz)
@@ -573,10 +521,9 @@ end
 """
     setup_sedov_blast(param) -> Problem
 
-Port of `setup_Sedov_Blast()` (`problems/sedov.c`). Box 3 x 3 x 3, periodic,
-constant density `1.24e7`, `Rho_Max = 1.24e7`. `postprocess!` injects the
-supernova energy into the innermost ~`NNpart`(=296) particles (port of
-`Sedov_Blast_PostProcessing` + `Sedov_Blast_abs`).
+Box 3 x 3 x 3, periodic, constant density `1.24e7`, `Rho_Max = 1.24e7`.
+`postprocess!` injects the supernova energy into the innermost `NNpart`(=296)
+particles.
 """
 function setup_sedov_blast(param::Parameters)
     return Problem(
@@ -592,10 +539,9 @@ function setup_sedov_blast(param::Parameters)
     )
 end
 
-# --- Problem 4.2 : Kelvin-Helmholtz (problems/kelvin_helmholtz.c) ----------
+# --- Problem 4.2 : Kelvin-Helmholtz ---------------------------------------
 
-# isOuterLayer(ipart): outer layer if y/Boxsize[1] <= 1/3 or > 2/3.
-# C reads Problem.Boxsize[1] (C axis 1 == Julia boxsize[2]).
+# outer layer if y/boxsize_y <= 1/3 or > 2/3
 @inline function _kh_is_outer_layer(particles::Particles, ipart::Int,
                                     boxsize_y::Float64)
     y = particles.pos[ipart][2]
@@ -606,15 +552,13 @@ end
 """
     setup_kelvin_helmholtz(param) -> Problem
 
-Port of `setup_Kelvin_Helmholtz_Instability()`
-(`problems/kelvin_helmholtz.c`). Box 256 x 256 x 16 (already satisfies the
-`Boxsize[1]` (C axis 0) = largest invariant), periodic, `Rho_Max = 6.26e-8`.
-The `density_function_correction` argument is unused by the C density function
-(kept for signature parity).
+Box 256 x 256 x 16, periodic, `Rho_Max = 6.26e-8`. The
+`density_function_correction` argument is unused here (kept for signature
+parity).
 """
 function setup_kelvin_helmholtz(param::Parameters)
     boxsize = (256.0, 256.0, 16.0)
-    by = boxsize[2]   # C Problem.Boxsize[1]
+    by = boxsize[2]
 
     density = function (particles::Particles, ipart::Int, density_function_correction)
         return _kh_is_outer_layer(particles, ipart, by) ? 3.13e-8 : 6.26e-8
@@ -650,15 +594,15 @@ function setup_kelvin_helmholtz(param::Parameters)
     )
 end
 
-# --- Problem 4.3 : Keplerian Ring — C "Error in result" -------------------
+# --- Problem 4.3 : Keplerian Ring — flagged "Error in result" -------------
 
 function setup_keplerian_ring(param::Parameters)
     error("problem 4.3 (Keplerian Ring) is flagged \"Error in result. " *
           "Needs to be checked.\" in the C reference (ics.par); not ported " *
-          "in Phase 4 to avoid silently shipping a wrong IC.")
+          "(avoids shipping a wrong IC).")
 end
 
-# --- Problem 4.4 : Cold Blob (problems/blob.c) ----------------------------
+# --- Problem 4.4 : Cold Blob ----------------------------------------------
 
 function setup_blob(param::Parameters)
     bx = 8000.0; by = 2000.0; bz = 2000.0
@@ -686,15 +630,14 @@ function setup_blob(param::Parameters)
     )
 end
 
-# --- Problem 4.5 : Hydrostatic Sphere — C "not implemented yet" -----------
+# --- Problem 4.5 : Hydrostatic Sphere — flagged "not implemented yet" ------
 
 function setup_hydrostatic_sphere(param::Parameters)
     error("problem 4.5 (Hydrostatic Sphere) is flagged \"not implemented " *
-          "yet\" in the C reference (ics.par; no C source exists); not " *
-          "ported in Phase 4.")
+          "yet\" in the C reference (ics.par; no C source exists); not ported.")
 end
 
-# --- Problem 4.6 : Evrard Collapse (problems/evrard.c) --------------------
+# --- Problem 4.6 : Evrard Collapse ----------------------------------------
 
 function setup_evrard_collapse(param::Parameters)
     bx = 10.0; by = 10.0; bz = 10.0
@@ -722,7 +665,7 @@ function setup_evrard_collapse(param::Parameters)
     )
 end
 
-# --- Problem 4.7 : Zeldovich Pancake (problems/zeldovich_pancake.c) -------
+# --- Problem 4.7 : Zeldovich Pancake --------------------------------------
 
 const _ZP_HUBBLE = 67.74
 const _ZP_G = 6.67259e-8
@@ -772,14 +715,10 @@ function setup_zeldovich_pancake(param::Parameters)
     )
 end
 
-# --- Problem 4.8 : Box (problems/box.c) -----------------------------------
+# --- Problem 4.8 : Box ----------------------------------------------------
 
-# Port of box.c::isInnerBox. Two C quirks preserved (faithful port; not
-# "corrected"): (1) the y-bound uses Boxsize[0]*0.5 (NOT Boxsize[1]) exactly
-# as the C source; (2) C's `abs()` is the <stdlib.h> integer abs, but the
-# argument here is a positive constant (bx*0.5, bz*0.5), so float `abs` and
-# the (degenerate) integer reading agree in sign — float abs is used so the
-# IC is the obviously-intended centred box rather than a degenerate one.
+# inner box test. The y-bound uses bx*0.5 (not by*0.5); the arguments to
+# `abs` are positive constants, so it just reproduces the centred box.
 @inline function _box_is_inner(particles::Particles, ipart::Int,
                                 bx, by, bz)::Bool
     p = particles.pos[ipart]
@@ -815,7 +754,7 @@ function setup_box(param::Parameters)
     )
 end
 
-# --- Problem 4.9 : Gresho Vortex (problems/gresho.c) ----------------------
+# --- Problem 4.9 : Gresho Vortex ------------------------------------------
 
 function setup_gresho_vortex(param::Parameters)
     bx = 1.0; by = 1.0; bz = 0.1
@@ -865,15 +804,14 @@ function setup_gresho_vortex(param::Parameters)
     )
 end
 
-# --- Problem 4.10 : Exponential Disk — C "does not work" ------------------
+# --- Problem 4.10 : Exponential Disk — flagged "does not work" -------------
 
 function setup_exponential_disk(param::Parameters)
     error("problem 4.10 (Exponential Disk) is flagged \"does not work\" in " *
-          "the C reference (ics.par); not ported in Phase 4 to avoid " *
-          "silently shipping a wrong IC.")
+          "the C reference (ics.par); not ported (avoids shipping a wrong IC).")
 end
 
-# --- Problem 4.11 : Boss-Bodenheimer (problems/boss.c) --------------------
+# --- Problem 4.11 : Boss-Bodenheimer --------------------------------------
 
 function setup_boss(param::Parameters)
     b = 0.032
@@ -904,9 +842,9 @@ function setup_boss(param::Parameters)
     )
 end
 
-# --- Problem 4.12 : Isolated Galaxy Cluster (problems/galaxy_cluster.c) ----
+# --- Problem 4.12 : Isolated Galaxy Cluster --------------------------------
 
-# Halo β-model: Rho0=1e-26 g/cm^3, Beta=2/3, Rcore=20 kpc. Box 1000^3 kpc.
+# halo β-model: Rho0=1e-26 g/cm^3, Beta=2/3, Rcore=20 kpc. Box 1000^3 kpc.
 const _GC_RHO0 = 1e-26
 const _GC_BETA = 2.0 / 3.0
 const _GC_RCORE = 20.0
@@ -930,14 +868,14 @@ function setup_galaxy_cluster(param::Parameters)
         (true, true, true),
         _GC_RHO0,
         density,
-        zero_U,            # GalaxyCluster_U returns 0
-        zero_vec,          # GalaxyCluster_Velocity returns 0
+        zero_U,            # no internal energy
+        zero_vec,          # no velocity
         zero_vec,
-        make_turbulent_postprocess(),   # turbulent-B wired here (§1.9)
+        make_turbulent_postprocess(),   # turbulent B set here
     )
 end
 
-# --- Problem 5.0 : Fast Rotor (problems/rotor.c) --------------------------
+# --- Problem 5.0 : Fast Rotor ---------------------------------------------
 
 function setup_rotor(param::Parameters)
     bx = 1.0; by = 1.0; bz = 0.1
@@ -1002,7 +940,7 @@ function setup_rotor(param::Parameters)
     )
 end
 
-# --- Problem 5.1 : Strong Blast (problems/strong_blast.c) -----------------
+# --- Problem 5.1 : Strong Blast -------------------------------------------
 
 function setup_strong_blast(param::Parameters)
     bx = 1.0; by = 1.0; bz = 0.1
@@ -1038,7 +976,7 @@ function setup_strong_blast(param::Parameters)
     )
 end
 
-# --- Problem 5.2 : Orszag-Tang Vortex (problems/orszag_tang.c) ------------
+# --- Problem 5.2 : Orszag-Tang Vortex -------------------------------------
 
 function setup_orszag_tang_vortex(param::Parameters)
     bx = 1.0; by = 1.0; bz = 0.1
@@ -1077,7 +1015,7 @@ function setup_orszag_tang_vortex(param::Parameters)
     )
 end
 
-# --- Problem 5.3 : Linear Alfven Wave (problems/alfven.c) -----------------
+# --- Problem 5.3 : Linear Alfven Wave -------------------------------------
 
 function setup_linear_alfven_wave(param::Parameters)
     bx = 1.0; by = 0.1; bz = 0.1
@@ -1112,7 +1050,7 @@ function setup_linear_alfven_wave(param::Parameters)
     )
 end
 
-# --- Problem 5.4 : Rayleigh-Taylor Instability (problems/rayleigh_taylor.c) -
+# --- Problem 5.4 : Rayleigh-Taylor Instability ----------------------------
 
 function setup_rayleigh_taylor(param::Parameters)
     bx = 1.0; by = 0.5; bz = 0.1
@@ -1159,7 +1097,7 @@ function setup_rayleigh_taylor(param::Parameters)
     )
 end
 
-# --- Problem 5.5..5.16 : Ryu-Jones Shocktubes — C "not working" -----------
+# --- Problem 5.5..5.16 : Ryu-Jones Shocktubes — flagged "not working" ------
 
 const _RYU_JONES_NAMES = Dict(
      5 => "1A",  6 => "1B",  7 => "2A",  8 => "2B",
@@ -1171,16 +1109,16 @@ function _make_ryu_jones_error(subflag::Int)
     return function (param::Parameters)
         error("problem 5.$(subflag) (Ryu-Jones Shocktube $(name)) is " *
               "flagged \"not working\" in the C reference (ics.par); not " *
-              "ported in Phase 4 to avoid silently shipping a wrong IC.")
+              "ported (avoids shipping a wrong IC).")
     end
 end
 
-# --- Problem 6.x : User-defined ics (problems/user.c) ---------------------
+# --- Problem 6.x : User-defined ics ---------------------------------------
 
 function setup_user(param::Parameters)
     error("problem 6.$(param.Problem_Subflag) (user-defined IC, user.c) is " *
-          "not ported in Phase 4 — user.c is a per-user template with no " *
-          "fixed analytic formula; define it in Julia directly if needed.")
+          "not ported — user.c is a per-user template with no fixed analytic " *
+          "formula; define it in Julia directly if needed.")
 end
 
 # --- registry --------------------------------------------------------------
@@ -1189,12 +1127,10 @@ end
     PROBLEM_REGISTRY :: Dict{Tuple{Int,Int}, Function}
 
 Maps `(Problem_Flag, Problem_Subflag)` to a constructor
-`param::Parameters -> Problem`, mirroring the C `setup.c::setup_problem`
-switch and the `ics.par` header table. Problems flagged "not working" /
-"not implemented" / "Error in result" in the C reference are registered to
-an explicit error (the dispatch is complete, but a wrong IC is never
-silently produced). The PNG path (2.1) is registered to an out-of-scope
-error per the project scope decision.
+`param::Parameters -> Problem`, matching the `ics.par` header table. Problems
+flagged "not working" / "not implemented" / "Error in result" are registered
+to an explicit error, and the PNG path (2.1) to an out-of-scope error, so the
+dispatch is complete but a wrong IC is never silently produced.
 """
 const PROBLEM_REGISTRY = merge(Dict{Tuple{Int,Int},Function}(
     # 0.x — simple periodic tests
@@ -1232,8 +1168,8 @@ const PROBLEM_REGISTRY = merge(Dict{Tuple{Int,Int},Function}(
     (5, 3)  => setup_linear_alfven_wave,
     (5, 4)  => setup_rayleigh_taylor,
     ),
-    # Ryu-Jones shocktubes 5.5..5.16: all flagged "not working" in the C
-    # reference, registered to an explicit error so the dispatch stays complete.
+    # Ryu-Jones shocktubes 5.5..5.16: all flagged "not working", registered
+    # to an explicit error so the dispatch stays complete.
     Dict{Tuple{Int,Int},Function}(
         (5, sub) => _make_ryu_jones_error(sub) for sub in 5:16),
 )
@@ -1243,9 +1179,7 @@ const PROBLEM_REGISTRY = merge(Dict{Tuple{Int,Int},Function}(
 
 Dispatch on `(param.Problem_Flag, param.Problem_Subflag)` via
 [`PROBLEM_REGISTRY`](@ref). Flag 6 (user-defined) dispatches to
-[`setup_user`](@ref) for any subflag (mirroring the C `case 6`). Errors with
-the same message style as the C `Assert(false, "Effect %d.%d not
-implemented", ...)` for an unregistered problem.
+[`setup_user`](@ref) for any subflag. Errors for an unregistered problem.
 """
 function setup_problem(param::Parameters)
     key = (param.Problem_Flag, param.Problem_Subflag)

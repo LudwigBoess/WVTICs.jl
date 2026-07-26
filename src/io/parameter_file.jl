@@ -1,30 +1,11 @@
-# Pure-Julia port of `io.c::Read_param_file`.
+# Reads WVT parameter files into a `Parameters` (ports io.c::Read_param_file).
 #
-# The C parser:
-#   - reads the file line by line;
-#   - splits each line on whitespace via `sscanf(buf,"%s%s%s",...)`; a line
-#     with fewer than 2 tokens is skipped;
-#   - if the first token starts with '%' the line is a comment and is skipped;
-#   - otherwise the first token is matched against the known tag set; the first
-#     match consumes the tag (each tag is parsed at most once — `tagDone`);
-#   - the second token is converted with atoi/atof/strcpy per the tag type;
-#   - after the file, every tag must have been seen, else it errors and exits.
+# `read_param_file` dispatches on the extension: a `.toml` path is parsed via
+# the TOML standard library, any other extension uses the ASCII `tag value`
+# parser (comment character `%`, one value per tag). Both formats share the
+# same flat tag set and return an identical `Parameters`.
 #
-# Tag set: exactly the tags registered in `io.c::Read_param_file`, MINUS
-# `PNG_Filename` (PNG is out of scope per CLAUDE.md). `LimitMps`,
-# `LimitMps10`, `LimitMps100`, `LimitMps1000` map onto `Param.LimitMps[0..3]`.
-#
-# Note: C `atoi`/`atof` are lenient (parse a leading numeric prefix, default 0
-# on garbage). We use `parse` after a tolerant cleanup; values in real param
-# files are clean. `LimitMps -1` style integers parse fine as Float64.
-#
-# TOML support (Julia-port extension; no C analogue):
-#   `read_param_file` dispatches on the file extension: a `.toml` (case-
-#   insensitive) path is parsed via the `TOML` standard library
-#   (`read_param_toml`); every other extension uses the ASCII parser above,
-#   byte-for-byte unchanged. The TOML schema is a single FLAT top-level table
-#   whose keys are the same tags as the ASCII format (1:1):
-#
+# Tags:
 #     Npart, Maxiter, MpsFraction, StepReduction,
 #     LimitMps, LimitMps10, LimitMps100, LimitMps1000,
 #     MoveFractionMin, MoveFractionMax, ProbesFraction,
@@ -32,31 +13,25 @@
 #     (legacy alias `BiasCorrection` still accepted),
 #     Problem_Flag, Problem_Subflag, DesNumNgb
 #
-#   `DesNumNgb` is a Julia-port extension (no C analogue) setting the target SPH
-#   neighbour count (`DESNNGB`); it is OPTIONAL in both the ASCII and TOML paths
-#   and defaults to 0 (= use the selected kernel's built-in default).
+# `LimitMps`, `LimitMps10`, `LimitMps100`, `LimitMps1000` map onto
+# `LimitMps[1..4]`. `DesNumNgb` sets the target SPH neighbour count (`DESNNGB`);
+# it is optional and defaults to 0 (use the kernel's built-in default).
 #
-#   REQUIRED keys (error if absent, mirroring the ASCII "missing tag" error):
-#     Npart, Maxiter, Problem_Flag, Problem_Subflag.
-#   DEFAULTED keys (use the `Parameters()` kwdef default — all 0.0/0 — if
-#   omitted): every other tag above. The four `LimitMps*` keys map onto
-#   `LimitMps[1..4]`; any omitted limit defaults to 0.0.
-#   The `PNG_Filename` tag is out of scope and unsupported (an unknown key in
-#   the TOML table is ignored, exactly as the ASCII parser ignores it).
+# Required tags (error if absent): Npart, Maxiter, Problem_Flag,
+# Problem_Subflag. Every other tag defaults to the `Parameters()` default
+# (0/0.0; each omitted `LimitMps*` defaults to 0.0). `PNG_Filename` is not
+# supported: it is treated as an unknown tag and ignored on both paths.
 #
-# Type coercion: `TOML.parsefile` yields native Int/Float64/String. Integer
-# fields are coerced with `Int(...)` (a TOML float like `2000.0` for an Int
-# tag is accepted iff integral, matching the lenient ASCII intent); real
-# fields accept Int or Float and are coerced to `Float64`. The `LimitMps`
-# 4-tuple is built as `NTuple{4,Float64}`, identical to the ASCII path.
+# ASCII values are parsed leniently (leading numeric prefix, else 0), matching
+# C atoi/atof. TOML scalars are coerced: integer tags accept an Int or an
+# integral Float; real tags accept an Int or a Float coerced to Float64.
 import TOML
 
 # TOML key -> (field symbol, type). Same tag set / semantics as _PARAM_TAGS.
 const _PARAM_TOML_REQUIRED =
     ("Npart", "Maxiter", "Problem_Flag", "Problem_Subflag")
 
-# Coerce a TOML scalar to an Int the way the ASCII (atoi) path would: real
-# integers pass through; a Float64 must be integral.
+# Coerce a TOML scalar to Int: integers pass through, a Float must be integral.
 function _toml_to_int(key::AbstractString, v)
     if v isa Integer
         return Int(v)
@@ -68,10 +43,9 @@ function _toml_to_int(key::AbstractString, v)
     end
 end
 
-# Coerce a TOML scalar to Float64 (Int or Float accepted), like atof.
-# Special case: the (case-insensitive) string "auto" is accepted ONLY for the
-# `MpsFraction` tag and maps to the `0.0` auto-calibration sentinel (see
-# MPSFRACTION_ANALYSIS.md §4.3); a numeric value keeps exact legacy behaviour.
+# Coerce a TOML scalar to Float64 (Int or Float accepted). The case-insensitive
+# string "auto" is accepted only for the `MpsFraction` tag and maps to the 0.0
+# auto-calibration sentinel; any numeric value is used as-is.
 function _toml_to_real(key::AbstractString, v)
     if v isa Real
         return Float64(v)
@@ -86,26 +60,24 @@ end
 """
     read_param_toml(filename::AbstractString) -> Parameters
 
-Parse a TOML parameter file into a [`Parameters`](@ref) (Julia-port
-extension; the C code has no TOML reader). The schema is a single flat
-top-level table whose keys are the same tags as the ASCII format:
+Parse a TOML parameter file into a [`Parameters`](@ref). The schema is a single
+flat top-level table whose keys are the same tags as the ASCII format:
 
 `Npart`, `Maxiter`, `MpsFraction`, `StepReduction`, `LimitMps`,
 `LimitMps10`, `LimitMps100`, `LimitMps1000`, `MoveFractionMin`,
 `MoveFractionMax`, `ProbesFraction`, `RedistributionFrequency`,
 `LastMoveStep`, `density_function_correction` (legacy alias `BiasCorrection`
-still accepted), `Problem_Flag`, `Problem_Subflag`, `DesNumNgb` (Julia-port
-extension: target SPH neighbour count `DESNNGB`, optional, defaults to 0).
+still accepted), `Problem_Flag`, `Problem_Subflag`, `DesNumNgb` (target SPH
+neighbour count `DESNNGB`, optional, defaults to 0).
 
 `Npart`, `Maxiter`, `Problem_Flag` and `Problem_Subflag` are **required**;
 every other key is optional and defaults to the `Parameters()` default
 (`0`/`0.0`; the `LimitMps*` entries default to `0.0`). Unknown keys (e.g.
-`PNG_Filename`) are ignored, exactly as the ASCII parser ignores unknown
-tags. Errors (mirroring the ASCII parser's `ErrorException`) if the file is
-missing or a required key is absent.
+`PNG_Filename`) are ignored. Errors if the file is missing or a required key is
+absent.
 
-The returned `Parameters` has identical field semantics and types to the
-value returned by the ASCII [`read_param_file`](@ref).
+The returned `Parameters` has identical field semantics and types to the value
+returned by the ASCII [`read_param_file`](@ref).
 """
 function read_param_toml(filename::AbstractString)
     isfile(filename) || error("Parameter file $filename not found.")
@@ -127,8 +99,7 @@ function read_param_toml(filename::AbstractString)
     limits = zeros(Float64, 4)
 
     for (rawkey, val) in table
-        # Resolve legacy key aliases (legacy `BiasCorrection` key still
-        # accepted, mapping to the renamed `density_function_correction`).
+        # Map the legacy `BiasCorrection` key onto `density_function_correction`.
         key = _canonical_param_tag(rawkey)
         entry = get(_PARAM_TAG_MAP, key, nothing)
         entry === nothing && continue             # unknown key (e.g. PNG_Filename)
@@ -184,18 +155,14 @@ function _store_param!(param::Parameters, limits::Vector{Float64},
     return nothing
 end
 
-# Optional parameter tags (Julia-port extensions with no C analogue): parsed if
-# present but NOT required — unlike every C tag, each of which must appear in an
-# ASCII file. `DesNumNgb` sets the target SPH neighbour count (`DESNNGB`) and
-# overrides the kernel's default when > 0; omitting it keeps the kernel default.
+# Optional parameter tags: parsed if present but not required. `DesNumNgb` sets
+# the target SPH neighbour count (`DESNNGB`) and overrides the kernel's default
+# when > 0; omitting it keeps the kernel default.
 const _PARAM_OPTIONAL_TAGS = ("DesNumNgb",)
 
-# Back-compatible legacy parameter-file tag aliases. The C reference parameter
-# file (`/e/ocean2/users/lboess/WVTICs/ics.par`) and all existing `.par`/`.toml`
-# files use the old C `BiasCorrection` tag; it is still accepted and maps onto
-# the renamed `density_function_correction` field (and the new
-# `density_function_correction` tag is accepted as well). Maps legacy tag ->
-# canonical tag (the canonical tag must exist in `_PARAM_TAGS`).
+# Legacy parameter-file tag aliases: maps an old tag to its canonical
+# `_PARAM_TAGS` name. `BiasCorrection` is still accepted and maps onto the
+# `density_function_correction` field.
 const _PARAM_TAG_ALIASES = Dict{String,String}(
     "BiasCorrection" => "density_function_correction",
 )
@@ -219,22 +186,18 @@ end
 """
     read_param_file(filename::AbstractString) -> Parameters
 
-Read a WVT parameter file into a [`Parameters`](@ref), dispatching on the
-file extension:
+Read a WVT parameter file into a [`Parameters`](@ref), dispatching on the file
+extension:
 
 - a `*.toml` path (extension match is case-insensitive) is parsed via
   [`read_param_toml`](@ref) (TOML standard library);
-- any other extension uses the pure-Julia port of `io.c::Read_param_file`,
-  the ASCII `tag value` parser (comment character `%`), **unchanged**.
+- any other extension uses the ASCII `tag value` parser (comment character
+  `%`).
 
-Both paths return the SAME `Parameters` type with identical field semantics
-and types. Errors (mirroring the C `exit(1)`) if the file is missing or if a
-required tag is absent. The `PNG_Filename` tag is intentionally not supported
-(PNG is out of scope, CLAUDE.md scope decisions); it is treated as an unknown
-tag and ignored on both paths.
-
-Correctly parses `/e/ocean2/users/lboess/WVTICs/ics.par` (ASCII) and the
-example `parameters.toml` (TOML).
+Both paths return the SAME `Parameters` type with identical field semantics and
+types. Errors if the file is missing or if a required tag is absent. The
+`PNG_Filename` tag is not supported; it is treated as an unknown tag and ignored
+on both paths.
 """
 function read_param_file(filename::AbstractString)
     if endswith(lowercase(String(filename)), ".toml")
@@ -243,34 +206,31 @@ function read_param_file(filename::AbstractString)
     return _read_param_ascii(filename)
 end
 
-# Pure-Julia port of `io.c::Read_param_file` (ASCII parser). Behaviourally
-# byte-for-byte the original `read_param_file`; only renamed so the public
-# `read_param_file` can dispatch ASCII vs TOML by extension.
+# ASCII `tag value` parser (ports io.c::Read_param_file). Dispatched to by the
+# public `read_param_file` for any non-`.toml` extension.
 function _read_param_ascii(filename::AbstractString)
     isfile(filename) || error("Parameter file $filename not found.")
 
     param = Parameters()
     limits = zeros(Float64, 4)
-    # Only the C tags are required; the Julia-port optional tags
-    # (`_PARAM_OPTIONAL_TAGS`, e.g. `DesNumNgb`) are omitted from the
-    # must-be-present set so existing `.par` files keep parsing.
+    # Optional tags (`_PARAM_OPTIONAL_TAGS`, e.g. `DesNumNgb`) are excluded from
+    # the required set, so files that omit them still parse.
     done = Dict{String,Bool}(t[1] => false for t in _PARAM_TAGS
                              if !(t[1] in _PARAM_OPTIONAL_TAGS))
 
     for raw in eachline(filename)
         tokens = split(raw)                       # whitespace split, drops empties
-        length(tokens) < 2 && continue            # sscanf(...) < 2  -> skip
-        startswith(tokens[1], '%') && continue    # buf1[0]=='%'     -> comment
+        length(tokens) < 2 && continue            # < 2 tokens  -> skip
+        startswith(tokens[1], '%') && continue    # leading '%' -> comment
 
-        # Resolve legacy tag aliases (e.g. the C `BiasCorrection` tag maps to
-        # the renamed `density_function_correction` field) before lookup so
-        # existing `.par` files (incl. the C reference `ics.par`) keep working.
+        # Resolve legacy tag aliases (`BiasCorrection` ->
+        # `density_function_correction`) before lookup.
         tag = _canonical_param_tag(tokens[1])
         val = tokens[2]
 
         entry = get(_PARAM_TAG_MAP, tag, nothing)
         entry === nothing && continue             # unknown tag (e.g. PNG_Filename)
-        haskey(done, tag) && done[tag] && continue # tagDone: parse once
+        haskey(done, tag) && done[tag] && continue # parse each tag at most once
 
         field, typ = entry
         if typ === :int
