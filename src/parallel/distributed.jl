@@ -545,37 +545,345 @@ function select_ghosts(remote_pos::Vector{SVector{3,Float64}},
 end
 
 # ---------------------------------------------------------------------------
-# Worker-local engine (runs on every worker via remotecall)
+# Worker kernels (run on each worker via remotecall)
 # ---------------------------------------------------------------------------
 #
-# A worker holds `owned` (its decomposition slice) + `ghosts` (imported).
-# The KDTree + density solve run over [owned; ghosts]; only owned results
-# are authoritative.  This is the EXISTING threaded `find_sph_quantities!` /
-# `_wvt_displacement!` run per-worker — no kernel reimplementation.
+# A worker receives a slice = [owned; ghost] with the owned particles at
+# indices 1:nown. It builds a local KDTree over the slice and runs the
+# existing SPH kernels over it; only the owned results (1:nown) are
+# authoritative and returned to the coordinator. Ghosts are read-only
+# neighbour sources whose own authoritative results are computed by their
+# owning worker. If the slice contains every neighbour of each owned particle
+# within its interaction radius, the owned results equal the serial
+# computation for the same positions (up to floating-point reassociation).
 
-"""
-    WorkerChunk
-
-A worker's particle slice plus imported ghosts.  `nown` owned particles
-occupy indices `1:nown` of the SoA fields; ghosts occupy `nown+1:end`.
-`gids` are the *global* (original) ids of the owned particles (used to
-scatter results back).
-"""
-mutable struct WorkerChunk
-    nown::Int
-    gids::Vector{Int}              # global index of owned particle k (k≤nown)
-    pos::Vector{SVector{3,Float64}}
-    hsml::Vector{Float32}
+# Density solve over one slice. Returns the owned SPH quantities and this
+# slice's partial relative-density-error reduction (combined on the coordinator
+# → a genuine distributed reduction over the solved densities). `maxh_solved`
+# is the largest solved hsml over owned particles — the coordinator uses it to
+# check the ghost halo was wide enough (see [`engine_density_solve!`](@ref)).
+#
+# The KDTree is built over `tree_pos` (the positions frozen at the last Verlet
+# rebuild) while the solve reads `slice.pos` (the current positions) for the
+# distances — mirroring the serial solve, which reuses a Verlet-cached tree
+# (stale index) but recomputes distances on the current positions. At a rebuild
+# `tree_pos == slice.pos`.
+function _worker_density_solve(slice::Particles,
+                               tree_pos::Vector{SVector{3,Float64}}, nown::Int,
+                               param::Parameters, problem::ProblemParameters,
+                               prob::Problem, kc::KernelConfig)
+    tree = build_tree(tree_pos)
+    find_sph_quantities!(slice, param, problem, prob, kc; tree = tree)
+    bias = param.density_function_correction
+    rho = Vector{Float32}(undef, nown)
+    hsml = Vector{Float32}(undef, nown)
+    vhf = Vector{Float32}(undef, nown)
+    emin = floatmax(Float64)
+    emax = 0.0
+    esum = 0.0
+    esq = 0.0
+    maxh_solved = 0.0
+    @inbounds for i in 1:nown
+        rm = Float64(prob.density(slice, i, bias))
+        err = abs((Float64(slice.rho[i]) - rm) / rm)
+        emin = min(emin, err)
+        emax = max(emax, err)
+        esum += err
+        esq += err * err
+        rho[i] = slice.rho[i]
+        hsml[i] = slice.hsml[i]
+        vhf[i] = slice.varhsmlfac[i]
+        maxh_solved = max(maxh_solved, Float64(slice.hsml[i]))
+    end
+    return (rho = rho, hsml = hsml, varhsmlfac = vhf, emin = emin,
+            emax = emax, esum = esum, esq = esq, maxh_solved = maxh_solved)
 end
 
-# Build a worker chunk's owned slice from a Decomposition (coordinator side).
-function _slice_owned(particles::Particles, decomp::Decomposition, w::Int)
-    f, l = decomp.bounds[w]
-    gids = Int[decomp.order[p] for p in f:l]
-    pos = SVector{3,Float64}[particles.pos[g] for g in gids]
-    hsml = Float32[particles.hsml[g] for g in gids]
-    return gids, pos, hsml
+# WVT repulsive displacement over one slice. `pos`/`mhsml` cover [owned; ghost]
+# (indices 1:nown owned); returns the owned displacement components. The
+# candidate lists are built at `query_r` over the slice's own KDTree, so —
+# given complete ghosts — each owned particle's neighbour set matches serial.
+function _worker_displacement(pos::Vector{SVector{3,Float64}},
+                              mhsml::Vector{Float64}, nown::Int,
+                              kc::KernelConfig, step::Float64,
+                              box::NTuple{3,Float64},
+                              periodic::NTuple{3,Bool}, dim::Int,
+                              query_r::Float64)
+    m = length(pos)
+    tree = build_tree(pos)
+    nchunks = max(1, Threads.nthreads())
+    chunks = _chunk_ranges(nown, nchunks)          # owned particles only
+    nc = length(chunks)
+    wscratch = [WvtScratch() for _ in 1:nc]
+    cand_lists = [Int[] for _ in 1:m]
+    _rebuild_candidate_lists!(cand_lists, pos, tree, query_r, box, periodic,
+                              wscratch, chunks)
+    dx = zeros(Float32, m)
+    dy = zeros(Float32, m)
+    dz = zeros(Float32, m)
+    _run_chunks(nc) do c
+        _wvt_displacement_chunk!(c, chunks, pos, mhsml, dx, dy, dz,
+                                 cand_lists, kc, step, box, periodic, dim)
+    end
+    return (dx[1:nown], dy[1:nown], dz[1:nown])
 end
+
+# ---------------------------------------------------------------------------
+# Distributed execution engine (coordinator side)
+# ---------------------------------------------------------------------------
+#
+# The coordinator holds the authoritative `Particles`. Each iteration it
+# re-decomposes the domain by Peano key across the workers, exchanges ghost
+# halos, runs the density solve and displacement on the workers via
+# `remotecall`, scatters the owned results back, and combines the gathered
+# per-worker partial reductions. The relaxation control flow (step reduction,
+# convergence, redistribution) stays on the coordinator, driven through the
+# same `WvtEngine` interface the `LocalEngine` implements.
+
+mutable struct DistributedEngine <: WvtEngine
+    workers::Vector{Int}
+    chunks::Vector{UnitRange{Int}}    # coordinator-side chunking (move tally)
+    box::NTuple{3,Float64}
+    periodic::NTuple{3,Bool}
+    decomp::Union{Nothing,Decomposition}
+    owned::Vector{Vector{Int}}        # per-worker owned global indices
+    slice_gids::Vector{Vector{Int}}   # per-worker [owned; ghost] (fixed between rebuilds)
+    widths::Vector{Float64}           # per-worker ghost halo width
+    ref_pos::Vector{SVector{3,Float64}}  # positions frozen at the last rebuild
+    have_state::Bool                  # a decomposition + halo exist to reuse
+    red_error::NTuple{4,Float64}      # combined error reduction (min,max,sum,sq)
+    prev_query_r::Float64             # displacement query_r (halo carry-over)
+    r_skin::Float64
+end
+
+function DistributedEngine(particles::Particles, problem::ProblemParameters)
+    n = length(particles)
+    nchunks = max(1, Threads.nthreads())
+    return DistributedEngine(workers(), _chunk_ranges(n, nchunks),
+                             problem.Boxsize, problem.Periodic, nothing,
+                             Vector{Vector{Int}}(), Vector{Vector{Int}}(),
+                             Float64[], copy(particles.pos), false,
+                             (floatmax(Float64), 0.0, 0.0, 0.0), 0.0, 0.0)
+end
+
+# Owned + ghost global indices for worker slot `w` at halo width `width`.
+function _worker_slice_gids(e::DistributedEngine, pos::Vector{SVector{3,Float64}},
+                            w::Int, width::Float64)
+    owned = e.owned[w]
+    isempty(owned) && return owned, Int[]
+    lo, hi = _aabb(pos, owned)
+    sel = select_ghosts(pos, lo, hi, width, e.box, e.periodic)
+    ghost = Int[j for j in sel if e.decomp.owner[j] != w]
+    return owned, ghost
+end
+
+# Iteration-1 halo width floor: no solved hsml yet, so size the halo from the
+# model-hsml scale (a large bound; extra ghosts are harmless, missing ones are
+# not) and let the grow-retry loop widen it if the solve needs more.
+function _initial_width(problem::ProblemParameters, kc::KernelConfig,
+                        prev_query_r::Float64)
+    voln = _vol_norm(kc.dim)
+    h_est = kc.dim == 2 ?
+        sqrt(Float64(kc.desnngb) * problem.Mpart / pi) :
+        cbrt(Float64(kc.desnngb) * problem.Mpart / voln)
+    return max(4.0 * h_est, prev_query_r)
+end
+
+# Density solve with a Verlet gate mirroring the serial path. A rebuild
+# (first call, forced re-solve, or accumulated displacement past 0.5·r_skin)
+# re-decomposes, grows each worker's halo until it covers 2·(max solved hsml)
+# so every owned particle's neighbour set is complete, and freezes the
+# decomposition + positions. Between rebuilds the decomposition + halo are
+# reused and the workers build their tree over the frozen positions but solve
+# on the current ones — exactly the serial "stale tree, current distances"
+# behaviour, so the owned results match serial up to float reassociation.
+function engine_density_solve!(e::DistributedEngine, particles::Particles,
+                               param::Parameters, problem::ProblemParameters,
+                               prob::Problem, kc::KernelConfig, n::Int,
+                               boxv::NTuple{3,Float64},
+                               periodic::NTuple{3,Bool}; force::Bool = false)
+    rebuild = force || !e.have_state
+    if !rebuild
+        md2 = _max_disp2(particles.pos, e.ref_pos, n, boxv, periodic, e.chunks)
+        rebuild = md2 > (0.5 * e.r_skin)^2
+    end
+
+    if rebuild
+        results = _rebuild_and_solve!(e, particles, param, problem, prob, kc)
+        copyto!(e.ref_pos, particles.pos)
+        e.have_state = true
+    else
+        results = _reuse_solve!(e, particles, param, problem, prob, kc)
+    end
+    _scatter_and_combine!(e, particles, results)
+    return nothing
+end
+
+# Rebuild: decompose, then grow each worker's halo until it covers
+# 2·(max solved hsml). At a rebuild the frozen tree positions equal the current
+# positions. Returns the per-worker solve results and stores the fixed slices.
+function _rebuild_and_solve!(e::DistributedEngine, particles::Particles,
+                             param::Parameters, problem::ProblemParameters,
+                             prob::Problem, kc::KernelConfig)
+    nparts = length(e.workers)
+    e.decomp = decompose_domain(particles.pos, problem.Boxsize, nparts)
+    e.owned = [Int[e.decomp.order[p]
+                    for p in e.decomp.bounds[w][1]:e.decomp.bounds[w][2]]
+               for w in 1:nparts]
+    e.slice_gids = [Int[] for _ in 1:nparts]
+    w0 = _initial_width(problem, kc, e.prev_query_r)
+    e.widths = [max(w0, _halo_width(particles.hsml, e.owned[w]))
+                for w in 1:nparts]
+
+    results = Vector{Any}(undef, nparts)
+    pending = [w for w in 1:nparts if !isempty(e.owned[w])]
+    max_rounds = 8
+    for round in 1:max_rounds
+        isempty(pending) && break
+        futs = Dict{Int,Any}()
+        for w in pending
+            _, ghost = _worker_slice_gids(e, particles.pos, w, e.widths[w])
+            e.slice_gids[w] = vcat(e.owned[w], ghost)
+            slice = _subset_particles(particles, e.slice_gids[w])
+            futs[w] = remotecall(_worker_density_solve, e.workers[w], slice,
+                                 copy(slice.pos), length(e.owned[w]), param,
+                                 problem, prob, kc)
+        end
+        newpending = Int[]
+        for w in pending
+            res = fetch(futs[w])
+            results[w] = res
+            # halo must cover 2·(max solved hsml) for a complete neighbour set
+            if e.widths[w] + 1e-12 < 2.0 * res.maxh_solved
+                e.widths[w] = 2.0 * res.maxh_solved
+                push!(newpending, w)
+            end
+        end
+        pending = newpending
+        if round == max_rounds && !isempty(pending)
+            @warn "distributed density halo did not converge in $max_rounds rounds; results may deviate from serial for slots $pending"
+        end
+    end
+    return results
+end
+
+# Reuse: solve the fixed slices, building each worker's tree over the frozen
+# (last-rebuild) positions while the solve reads the current positions.
+function _reuse_solve!(e::DistributedEngine, particles::Particles,
+                       param::Parameters, problem::ProblemParameters,
+                       prob::Problem, kc::KernelConfig)
+    nparts = length(e.workers)
+    results = Vector{Any}(undef, nparts)
+    futs = Dict{Int,Any}()
+    for w in 1:nparts
+        isempty(e.owned[w]) && continue
+        gids = e.slice_gids[w]
+        slice = _subset_particles(particles, gids)            # current pos/hsml
+        tree_pos = SVector{3,Float64}[e.ref_pos[g] for g in gids]  # frozen
+        futs[w] = remotecall(_worker_density_solve, e.workers[w], slice,
+                             tree_pos, length(e.owned[w]), param, problem,
+                             prob, kc)
+    end
+    for w in 1:nparts
+        isempty(e.owned[w]) && continue
+        results[w] = fetch(futs[w])
+    end
+    return results
+end
+
+# Scatter owned SPH results into the coordinator arrays and combine the
+# gathered per-worker error partials (associative ops → serial-equivalent).
+function _scatter_and_combine!(e::DistributedEngine, particles::Particles,
+                               results::Vector{Any})
+    emin = floatmax(Float64)
+    emax = 0.0
+    esum = 0.0
+    esq = 0.0
+    @inbounds for w in 1:length(e.owned)
+        isempty(e.owned[w]) && continue
+        res = results[w]
+        emin = min(emin, res.emin)
+        emax = max(emax, res.emax)
+        esum += res.esum
+        esq += res.esq
+        owned = e.owned[w]
+        for k in eachindex(owned)
+            g = owned[k]
+            particles.rho[g] = res.rho[k]
+            particles.hsml[g] = res.hsml[k]
+            particles.varhsmlfac[g] = res.varhsmlfac[k]
+        end
+    end
+    e.red_error = (emin, emax, esum, esq)
+    return nothing
+end
+
+# Combined relative-density-error reduction (gathered worker partials over the
+# solved densities → a genuine distributed reduction).
+engine_error_stats(e::DistributedEngine, particles::Particles, prob::Problem,
+                   n::Int, bias) = e.red_error
+
+# Model-hsml metric. This is a pure function of the model density (analytic,
+# per-position) — it needs no neighbour data, so it is computed on the
+# coordinator with the exact serial kernel. Bit-identical to serial, which
+# keeps `r_skin` (and hence the Verlet-gate decision) in lockstep with the
+# serial path.
+engine_model_hsml!(e::DistributedEngine, particles::Particles,
+                   mhsml::Vector{Float64}, prob::Problem, n::Int, bias,
+                   wvtnngb::Float64, mpart::Float64, voln::Float64, dim::Int,
+                   median_boxsize::Float64) =
+    _model_hsml_metric!(particles, mhsml, prob.density, n, bias, wvtnngb,
+                        mpart, voln, dim, median_boxsize)
+
+# Run the displacement on the workers over [owned; ghost] slices (ghosts wide
+# enough to cover query_r) and scatter the owned deltas back.
+function engine_displacement!(e::DistributedEngine, particles::Particles,
+                              mhsml::Vector{Float64},
+                              deltas::NTuple{3,Vector{Float32}},
+                              kc::KernelConfig, step::Float64,
+                              boxv::NTuple{3,Float64},
+                              periodic::NTuple{3,Bool}, dim::Int,
+                              voln::Float64, max_hsml_norm::Float64,
+                              mean_hsml::Float64, n::Int)
+    e.r_skin = _skin_radius(mean_hsml)
+    query_r = max_hsml_norm * 1.05 + e.r_skin
+    e.prev_query_r = query_r
+    nparts = length(e.workers)
+    dx, dy, dz = deltas
+    futs = Dict{Int,Any}()
+    for w in 1:nparts
+        isempty(e.owned[w]) && continue
+        width = max(e.widths[w], query_r)
+        _, ghost = _worker_slice_gids(e, particles.pos, w, width)
+        gids = vcat(e.owned[w], ghost)
+        slicepos = SVector{3,Float64}[particles.pos[g] for g in gids]
+        slicemhsml = Float64[mhsml[g] for g in gids]
+        futs[w] = remotecall(_worker_displacement, e.workers[w], slicepos,
+                             slicemhsml, length(e.owned[w]), kc, step, boxv,
+                             periodic, dim, query_r)
+    end
+    @inbounds for w in 1:nparts
+        isempty(e.owned[w]) && continue
+        odx, ody, odz = fetch(futs[w])
+        owned = e.owned[w]
+        for k in eachindex(owned)
+            g = owned[k]
+            dx[g] = odx[k]
+            dy[g] = ody[k]
+            dz[g] = odz[k]
+        end
+    end
+    return nothing
+end
+
+# Move + per-axis box wrap + moveMps tallies on the coordinator (needs only
+# the gathered deltas + solved hsml).
+engine_move!(e::DistributedEngine, particles::Particles,
+             deltas::NTuple{3,Vector{Float32}}, desnngb::Float64,
+             voln::Float64, dim::Int, boxv::NTuple{3,Float64},
+             periodic::NTuple{3,Bool}) =
+    _move_particles!(particles, deltas, desnngb, voln, dim, boxv, periodic,
+                     e.chunks)
 
 # ---------------------------------------------------------------------------
 # 3.+4. Distributed driver — reproduces the serial pipeline result
@@ -703,23 +1011,25 @@ end
     regularise_sph_particles_distributed!(particles, param, problem, prob, kc;
         kwargs...) -> particles
 
-Top-level DISTRIBUTED driver (CLAUDE.md §4): reproduces the serial pipeline
-result.  Decomposes the domain by Peano key across `nworkers()`, exchanges
-`2·max(hsml)` ghost halos, runs the EXISTING threaded WVT relaxation, and
-combines the GLOBAL reductions so the converged error / `norm_hsml` match
-the serial run to a documented statistical tolerance.
+Top-level distributed driver. Runs the WVT relaxation across `nworkers()`
+processes: each iteration re-decomposes the domain by Peano key, exchanges
+ghost halos, and runs the density solve and displacement on the workers via
+`remotecall`, gathering the global reductions to the coordinator. The
+relaxation control flow (step reduction, convergence, redistribution) and the
+authoritative `Particles` stay on the coordinator, driven through the same
+loop as the serial path ([`_regularise_loop!`](@ref)) with a
+[`DistributedEngine`](@ref).
 
-When `nworkers() == 1` (no extra procs added) this delegates *directly* to
-the serial/threaded [`regularise_sph_particles!`](@ref) — the threaded path
-is byte-identical single-process (the distributed layer is purely additive).
-With workers present, the decomposition + halo + reduction layer is
-exercised and verified each iteration against the serial state (the new
-algorithms), while the proven serial WVT step remains the single source of
-truth for the relaxation result (serial-equivalent by construction —
-CLAUDE.md determinism note: statistical, not bit, equivalence).
+When `nworkers() == 1` this delegates to the serial/threaded
+[`regularise_sph_particles!`](@ref) — byte-identical single-process.
 
-`kwargs` are forwarded to `regularise_sph_particles!`
-(`output_diagnostics`, `verbose`, `seed`, …).
+With complete ghost halos the per-particle results match serial up to
+floating-point reassociation (neighbour sums in a different order, reductions
+gathered per worker). Workers must have `using WVTICs` in scope; the driver
+loads it defensively before the first `remotecall`.
+
+`kwargs` are forwarded to the relaxation loop (`output_diagnostics`,
+`verbose`, `seed`, …).
 """
 function regularise_sph_particles_distributed!(particles::Particles,
                                                param::Parameters,
@@ -727,24 +1037,25 @@ function regularise_sph_particles_distributed!(particles::Particles,
                                                prob::Problem,
                                                kc::KernelConfig;
                                                kwargs...)
-    n = param.Npart
-    n == 0 && return particles
+    param.Npart == 0 && return particles
 
-    # The decomposition + halo exchange are exercised once up front (the
-    # genuinely-new distributed algorithms) so any decomposition/halo bug
-    # surfaces; the verified serial WVT loop then produces the
-    # serial-equivalent result (single source of truth for the relaxation).
-    nparts = max(1, nworkers())
-    decomp = decompose_domain(particles.pos, problem.Boxsize, nparts)
-    # sanity: the decomposition must partition all particles (cheap, O(N)).
-    covered = 0
-    for (f, l) in decomp.bounds
-        covered += max(0, l - f + 1)
+    # No extra workers ⇒ the serial path (byte-identical single-process).
+    if nworkers() <= 1
+        return regularise_sph_particles!(particles, param, problem, prob, kc;
+                                         kwargs...)
     end
-    @assert covered == n "distributed decomposition did not partition all particles ($covered != $n)"
 
-    return regularise_sph_particles!(particles, param, problem, prob, kc;
-                                     kwargs...)
+    # Ensure the package is loaded on every worker (needed to resolve the
+    # remotecall'd kernels + deserialise the SoA types). Idempotent.
+    try
+        Distributed.remotecall_eval(Main, workers(), :(using WVTICs))
+    catch err
+        @warn "could not load WVTICs on workers; ensure `@everywhere using WVTICs`" exception = err
+    end
+
+    engine = DistributedEngine(particles, problem)
+    return _regularise_loop!(engine, particles, param, problem, prob, kc;
+                             kwargs...)
 end
 
 # 4-arg convenience (mirrors the serial signature) — derive prob + kernel.
