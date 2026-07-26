@@ -1901,7 +1901,7 @@ end
     function _movemps0_at(ps, param, problem, prob, kc, step)
         n = param.Npart
         dim = kc.dim
-        voln = WVTICs._wvt_vol_norm(dim)
+        voln = WVTICs._vol_norm(dim)
         desnngb = Float64(kc.desnngb)
         wvtnngb = desnngb
         mpart = Float64(problem.Mpart)
@@ -1973,7 +1973,7 @@ end
         # call the calibration in isolation exactly as the loop does.
         n = param.Npart
         dim = kc.dim
-        voln = WVTICs._wvt_vol_norm(dim)
+        voln = WVTICs._vol_norm(dim)
         desnngb = Float64(kc.desnngb)
         wvtnngb = desnngb
         mpart = Float64(problem.Mpart)
@@ -2242,7 +2242,7 @@ end
         pos0 = deepcopy(ps.pos)
 
         n = N
-        voln = WVTICs._wvt_vol_norm(3)
+        voln = WVTICs._vol_norm(3)
         desnngb = Float64(kc.desnngb)
         box = problem.Boxsize
         boxv = (box[1], box[2], box[3])

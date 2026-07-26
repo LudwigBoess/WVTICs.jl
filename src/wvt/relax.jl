@@ -43,14 +43,9 @@
 
 using StaticArrays
 
-# ALWAYS returns `Float64` (never `Irrational{:π}`) — see the `_vol_norm`
-# note in src/sph/density.jl. `voln` is passed as a concrete `::Float64`
-# argument into `_fill_model_hsml!` / `_wvt_displacement!` / `_count_moves`
-# / `_move_particles!` / `_autocalibrate_step`; a bare `pi` (dim==2) is
-# `Irrational{:π}` ⇒ MethodError on those `::Float64` signatures (the 2D
-# auto-path bug). `Float64(pi)` makes the 2D model-hsml/displacement path
-# type-stable end to end.
-@inline _wvt_vol_norm(dim::Int) = dim == 2 ? Float64(pi) : (4.0 * pi / 3.0)
+# Number of particles along one box edge (N^(1/dim)); the mean particle
+# spacing that sets the WVT step scale.
+@inline _npart_1d(n::Int, dim::Int) = dim == 2 ? n^(1.0 / 2.0) : n^(1.0 / 3.0)
 
 # C `Find_sph_quantities` rebuilds the octree every iteration.  We instead use
 # a Verlet skin: the cached candidate lists (and the KDTree) stay valid while
@@ -90,9 +85,8 @@ const MPS_AUTO_MAX_TRIALS = 12
 # MpsFraction, dimension-aware npart_1D — identical algebra to the C
 # `step = 1/(npart_1D·MpsFraction)`).
 @inline function _analytic_seed_step(n::Int, dim::Int)
-    npart_1d = dim == 2 ? n^(1.0 / 2.0) : n^(1.0 / 3.0)
     seed_mps = dim == 2 ? MPS_AUTO_SEED_2D : MPS_AUTO_SEED_3D
-    return 1.0 / (npart_1d * seed_mps)
+    return 1.0 / (_npart_1d(n, dim) * seed_mps)
 end
 
 # Per-chunk scratch for the displacement loop: a cached candidate list per
@@ -138,7 +132,7 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     boxv = (box[1], box[2], box[3])
     periodic = problem.Periodic
     dim = kc.dim
-    voln = _wvt_vol_norm(dim)
+    voln = _vol_norm(dim)
     desnngb = Float64(kc.desnngb)
     mpart = Float64(problem.Mpart)
     wvtnngb = desnngb                       # C: #define WVTNNGB DESNNGB
@@ -153,8 +147,7 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     # behaviour: step = 1/(npart_1D·MpsFraction), npart_1D = N^(1/3) (2D
     # N^(1/2)) — byte-identical to the pre-substep formula / the C code.
     auto_mps = _is_auto_mps(param.MpsFraction)
-    npart_1d = dim == 2 ? n^(1.0 / 2.0) : n^(1.0 / 3.0)
-    step = auto_mps ? 0.0 : 1.0 / (npart_1d * param.MpsFraction)
+    step = auto_mps ? 0.0 : 1.0 / (_npart_1d(n, dim) * param.MpsFraction)
 
     errLast = floatmax(Float64)
     errDiff = floatmax(Float64)
@@ -352,21 +345,10 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
         errLast = errMean
 
         # --- 6. model-density metric hsml + norm --------------------------
-        # Function barrier isolates the `prob.density` ::Function-field call
-        # (mirrors Phase-2 `_fill_rho_model!`); keeps the N-loop type-stable.
-        vSphSum, max_hsml =
-            _fill_model_hsml!(particles, mhsml, prob.density, n,
-                              param.density_function_correction, wvtnngb,
-                              mpart, voln, dim)
-        norm_hsml = dim == 2 ?
-            sqrt(wvtnngb / vSphSum / pi) * median_boxsize :
-            cbrt(wvtnngb / vSphSum / voln) * median_boxsize
-        @inbounds for i in 1:n
-            mhsml[i] *= norm_hsml
-        end
-        mean_hsml = (vSphSum / n)
-        mean_hsml = dim == 2 ? sqrt(mean_hsml) : cbrt(mean_hsml)
-        mean_hsml *= norm_hsml
+        max_hsml_norm, mean_hsml =
+            _model_hsml_metric!(particles, mhsml, prob.density, n,
+                                param.density_function_correction, wvtnngb,
+                                mpart, voln, dim, median_boxsize)
 
         # --- Verlet skin: refresh the cached candidate lists --------------
         # r_skin scales with the (normalised) model hsml — the radius the
@@ -378,7 +360,6 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
         # The candidate lists are rebuilt exactly when the tree was rebuilt
         # this iteration (Verlet gate at step 0) — never on stale positions.
         r_skin = _skin_radius(mean_hsml)
-        max_hsml_norm = max_hsml * norm_hsml
         query_r = max_hsml_norm * 1.05 + r_skin
 
         if tree_rebuilt || !have_lists
@@ -525,6 +506,28 @@ function _fill_model_hsml!(particles::Particles, mhsml::Vector{Float64},
     return vSphSum, max_hsml
 end
 
+# Fill the model-density metric hsml, normalise it so the total kernel volume
+# matches the box, and return `(max_hsml_norm, mean_hsml)` — the normalised
+# largest and mean model hsml used to size the Verlet skin / query radius.
+# `mhsml` is scaled in place by the normalisation factor.
+function _model_hsml_metric!(particles::Particles, mhsml::Vector{Float64},
+                             dfun::F, n::Int, density_function_correction,
+                             wvtnngb::Float64, mpart::Float64, voln::Float64,
+                             dim::Int, median_boxsize::Float64) where {F}
+    vSphSum, max_hsml =
+        _fill_model_hsml!(particles, mhsml, dfun, n,
+                          density_function_correction, wvtnngb, mpart, voln, dim)
+    norm_hsml = dim == 2 ?
+        sqrt(wvtnngb / vSphSum / pi) * median_boxsize :
+        cbrt(wvtnngb / vSphSum / voln) * median_boxsize
+    @inbounds for i in 1:n
+        mhsml[i] *= norm_hsml
+    end
+    mean_hsml = dim == 2 ? sqrt(vSphSum / n) : cbrt(vSphSum / n)
+    mean_hsml *= norm_hsml
+    return max_hsml * norm_hsml, mean_hsml
+end
+
 # --- MpsFraction startup auto-calibration ----------------------------------
 # MPSFRACTION_ANALYSIS.md §3/§4: analytic seed + log-space bisection of
 # `step` so the first-iteration moveMps[0] lands in the C author's
@@ -562,21 +565,12 @@ function _autocalibrate_step(particles::Particles, param::Parameters,
     tree = find_sph_quantities!(particles, param, problem, prob, kc;
                                 tree = tree)
     # model-density metric hsml + norm (positions-only; step-independent).
-    vSphSum, max_hsml =
-        _fill_model_hsml!(particles, mhsml, prob.density, n,
-                          param.density_function_correction, wvtnngb,
-                          mpart, voln, dim)
-    norm_hsml = dim == 2 ?
-        sqrt(wvtnngb / vSphSum / pi) * median_boxsize :
-        cbrt(wvtnngb / vSphSum / voln) * median_boxsize
-    @inbounds for i in 1:n
-        mhsml[i] *= norm_hsml
-    end
-    mean_hsml = vSphSum / n
-    mean_hsml = dim == 2 ? sqrt(mean_hsml) : cbrt(mean_hsml)
-    mean_hsml *= norm_hsml
+    max_hsml_norm, mean_hsml =
+        _model_hsml_metric!(particles, mhsml, prob.density, n,
+                            param.density_function_correction, wvtnngb,
+                            mpart, voln, dim, median_boxsize)
     r_skin = _skin_radius(mean_hsml)
-    query_r = max_hsml * norm_hsml * 1.05 + r_skin
+    query_r = max_hsml_norm * 1.05 + r_skin
     _rebuild_candidate_lists!(cand_lists, particles.pos, tree, query_r,
                               box, periodic, wscratch, chunks)
 
