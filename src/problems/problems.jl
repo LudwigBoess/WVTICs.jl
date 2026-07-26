@@ -1179,7 +1179,7 @@ const PROBLEM_REGISTRY = merge(Dict{Tuple{Int,Int},Function}(
 
 Dispatch on `(param.Problem_Flag, param.Problem_Subflag)` via
 [`PROBLEM_REGISTRY`](@ref). Flag 6 (user-defined) dispatches to
-[`setup_user`](@ref) for any subflag. Errors for an unregistered problem.
+`setup_user` for any subflag. Errors for an unregistered problem.
 """
 function setup_problem(param::Parameters)
     key = (param.Problem_Flag, param.Problem_Subflag)

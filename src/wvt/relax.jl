@@ -92,6 +92,119 @@ struct WvtScratch
 end
 WvtScratch() = WvtScratch(Int[])
 
+# --- per-iteration execution engine ----------------------------------------
+# The relaxation loop routes its per-particle kernels (density solve, error
+# reduction, model-hsml fill, displacement, move-tally) through an engine so
+# the same control flow drives either the shared-memory `LocalEngine` or the
+# distributed backend's engine (src/parallel/distributed.jl). The engine owns
+# the neighbour-search state (KDTree, cached candidate lists, Verlet-skin
+# reference positions); the loop owns the authoritative particle arrays and the
+# step/convergence logic.
+
+abstract type WvtEngine end
+
+# Shared-memory engine: the KDTree + cached candidate lists + Verlet-skin
+# reference positions that were previously loop-local. Reproduces the serial
+# per-iteration behaviour exactly.
+mutable struct LocalEngine <: WvtEngine
+    cand_lists::Vector{Vector{Int}}
+    ref_pos::Vector{SVector{3,Float64}}
+    wscratch::Vector{WvtScratch}
+    chunks::Vector{UnitRange{Int}}
+    tree::Union{Nothing,KDTree}
+    have_lists::Bool
+    r_skin::Float64
+    tree_rebuilt::Bool
+end
+
+function LocalEngine(particles::Particles)
+    n = length(particles)
+    nchunks = max(1, Threads.nthreads())
+    chunks = _chunk_ranges(n, nchunks)
+    nc = length(chunks)
+    return LocalEngine([Int[] for _ in 1:n], copy(particles.pos),
+                       [WvtScratch() for _ in 1:nc], chunks, nothing,
+                       false, 0.0, false)
+end
+
+# Verlet rebuild gate + SPH density solve. `force = true` skips the gate and
+# rebuilds the tree unconditionally (the post-redistribution re-solve, where
+# positions jumped arbitrarily).
+function engine_density_solve!(e::LocalEngine, particles::Particles,
+                               param::Parameters, problem::ProblemParameters,
+                               prob::Problem, kc::KernelConfig, n::Int,
+                               boxv::NTuple{3,Float64},
+                               periodic::NTuple{3,Bool}; force::Bool = false)
+    if force
+        e.tree = find_sph_quantities!(particles, param, problem, prob, kc;
+                                      tree = nothing)
+        copyto!(e.ref_pos, particles.pos)
+        e.have_lists = false
+        return nothing
+    end
+    e.tree_rebuilt = false
+    if !e.have_lists
+        e.tree = build_tree(particles.pos)
+        copyto!(e.ref_pos, particles.pos)
+        e.tree_rebuilt = true
+    else
+        md2 = _max_disp2(particles.pos, e.ref_pos, n, boxv, periodic, e.chunks)
+        if md2 > (0.5 * e.r_skin)^2
+            e.tree = build_tree(particles.pos)
+            copyto!(e.ref_pos, particles.pos)
+            e.tree_rebuilt = true
+        end
+    end
+    e.tree = find_sph_quantities!(particles, param, problem, prob, kc;
+                                  tree = e.tree)
+    return nothing
+end
+
+# Relative-density-error reduction → (errMin, errMax, errSum, errSq).
+engine_error_stats(e::LocalEngine, particles::Particles, prob::Problem,
+                   n::Int, bias) =
+    _error_stats(particles, prob.density, n, bias, e.chunks)
+
+# Fill the model-density metric hsml and normalise it → (max_hsml_norm,
+# mean_hsml).
+engine_model_hsml!(e::LocalEngine, particles::Particles, mhsml::Vector{Float64},
+                   prob::Problem, n::Int, bias, wvtnngb::Float64,
+                   mpart::Float64, voln::Float64, dim::Int,
+                   median_boxsize::Float64) =
+    _model_hsml_metric!(particles, mhsml, prob.density, n, bias, wvtnngb,
+                        mpart, voln, dim, median_boxsize)
+
+# Refresh the Verlet candidate lists (only when the tree was rebuilt this
+# iteration or the lists were invalidated) and run the repulsive displacement.
+function engine_displacement!(e::LocalEngine, particles::Particles,
+                              mhsml::Vector{Float64},
+                              deltas::NTuple{3,Vector{Float32}},
+                              kc::KernelConfig, step::Float64,
+                              boxv::NTuple{3,Float64},
+                              periodic::NTuple{3,Bool}, dim::Int,
+                              voln::Float64, max_hsml_norm::Float64,
+                              mean_hsml::Float64, n::Int)
+    e.r_skin = _skin_radius(mean_hsml)
+    query_r = max_hsml_norm * 1.05 + e.r_skin
+    if e.tree_rebuilt || !e.have_lists
+        _rebuild_candidate_lists!(e.cand_lists, particles.pos, e.tree,
+                                  query_r, boxv, periodic, e.wscratch,
+                                  e.chunks)
+        e.have_lists = true
+    end
+    _wvt_displacement!(particles, mhsml, deltas, e.cand_lists, kc, step,
+                       boxv, periodic, dim, voln, e.chunks)
+    return nothing
+end
+
+# Move particles by the displacement + per-axis box wrap → moveMps tallies.
+engine_move!(e::LocalEngine, particles::Particles,
+             deltas::NTuple{3,Vector{Float32}}, desnngb::Float64,
+             voln::Float64, dim::Int, boxv::NTuple{3,Float64},
+             periodic::NTuple{3,Bool}) =
+    _move_particles!(particles, deltas, desnngb, voln, dim, boxv, periodic,
+                     e.chunks)
+
 """
     regularise_sph_particles!(particles, param, problem, prob, kc;
         save_wvt_steps = false, output_diagnostics = true,
@@ -111,12 +224,24 @@ Returns `particles` (mutated in place).
 """
 function regularise_sph_particles!(particles::Particles, param::Parameters,
                                    problem::ProblemParameters, prob::Problem,
-                                   kc::KernelConfig;
-                                   save_wvt_steps::Bool = false,
-                                   output_diagnostics::Bool = true,
-                                   diagnostics_path::AbstractString = "diagnostics.log",
-                                   seed::Integer = RNG_BASE_SEED,
-                                   verbose::Bool = true)
+                                   kc::KernelConfig; kwargs...)
+    param.Npart == 0 && return particles
+    engine = LocalEngine(particles)
+    return _regularise_loop!(engine, particles, param, problem, prob, kc;
+                             kwargs...)
+end
+
+# Core relaxation loop, driven through a `WvtEngine` (see the engine block
+# above). The engine owns the neighbour-search state; this function owns the
+# authoritative particle arrays and the step/convergence control flow.
+function _regularise_loop!(engine::WvtEngine, particles::Particles,
+                           param::Parameters, problem::ProblemParameters,
+                           prob::Problem, kc::KernelConfig;
+                           save_wvt_steps::Bool = false,
+                           output_diagnostics::Bool = true,
+                           diagnostics_path::AbstractString = "diagnostics.log",
+                           seed::Integer = RNG_BASE_SEED,
+                           verbose::Bool = true)
 
     n = param.Npart
     n == 0 && return particles
@@ -161,42 +286,31 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     dz = zeros(Float32, n)
     deltas = (dx, dy, dz)
 
-    # Verlet-skin state: cached per-particle candidate index lists, the radius
-    # they were queried at, and the reference positions at the last (re)build.
-    cand_lists = [Int[] for _ in 1:n]
-    ref_pos = copy(particles.pos)
-    r_skin = 0.0
-    tree::Union{Nothing,KDTree} = nothing
-    have_lists = false
-
-    nchunks = max(1, Threads.nthreads())
-    chunks = _chunk_ranges(n, nchunks)
-    nc = length(chunks)
-    wscratch = [WvtScratch() for _ in 1:nc]
-
     # --- MpsFraction startup auto-calibration --------------------------------
     # Only when MpsFraction was omitted/0.0/"auto". Computes the step-
     # independent tree/density solve/model-hsml/candidate lists once and
     # bisects `step` so the first-iteration moveMps[0] lands in the accept
     # band. Does not mutate positions and does not advance the relaxation; the
     # main loop rebuilds its own it==1 tree/solve from the untouched positions.
+    # Runs serially on the coordinator with its own scratch (a one-off setup,
+    # independent of the engine's per-iteration state).
     if auto_mps
+        nchunks = max(1, Threads.nthreads())
+        cchunks = _chunk_ranges(n, nchunks)
+        ccand = [Int[] for _ in 1:n]
+        cwscratch = [WvtScratch() for _ in 1:length(cchunks)]
         step = _autocalibrate_step(particles, param, problem, prob, kc,
-                                   mhsml, deltas, cand_lists, wscratch,
-                                   chunks, n, boxv, periodic, dim, voln,
+                                   mhsml, deltas, ccand, cwscratch,
+                                   cchunks, n, boxv, periodic, dim, voln,
                                    desnngb, wvtnngb, mpart, median_boxsize;
                                    verbose = verbose)
         # zero the scratch the calibration touched so the main loop starts
-        # clean (cand_lists/mhsml are recomputed at it==1; deltas is defensively
-        # zeroed so no stale calibration displacement leaks).
+        # clean (mhsml is recomputed at it==1; deltas is defensively zeroed so
+        # no stale calibration displacement leaks).
         fill!(dx, 0.0f0)
         fill!(dy, 0.0f0)
         fill!(dz, 0.0f0)
-        for cl in cand_lists
-            empty!(cl)
-        end
         fill!(mhsml, 0.0)
-        copyto!(ref_pos, particles.pos)
         if !(isfinite(step) && step > 0.0)      # final safety net
             step = _analytic_seed_step(n, dim)
         end
@@ -209,34 +323,14 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
     it = 0
     while true
 
-        # --- 0. Verlet rebuild gate (BEFORE the SPH solve) ----------------
-        # Rebuild the KDTree only when the max accumulated min-image
+        # --- 0.+1. Verlet rebuild gate + SPH quantities -------------------
+        # The engine rebuilds the KDTree only when the max accumulated min-image
         # displacement since the last build exceeds 0.5·r_skin (or on the first
-        # iteration, or right after a redistribution — flagged via
-        # have_lists=false). Doing this before find_sph! guarantees the density
-        # solve and the displacement loop consume the same fresh-enough tree.
-        # r_skin is carried from the previous iteration (the model-density
-        # length scale is essentially static — box volume is conserved). The
-        # first iteration has r_skin==0 ⇒ have_lists==false ⇒ rebuild.
-        tree_rebuilt = false
-        if !have_lists
-            tree = build_tree(particles.pos)
-            copyto!(ref_pos, particles.pos)
-            tree_rebuilt = true
-        else
-            md2 = _max_disp2(particles.pos, ref_pos, n, boxv, periodic, chunks)
-            if md2 > (0.5 * r_skin)^2
-                tree = build_tree(particles.pos)
-                copyto!(ref_pos, particles.pos)
-                tree_rebuilt = true
-            end
-        end
-
-        # --- 1. SPH quantities (hsml/rho/varhsmlfac/rho_model) -------------
-        # find_sph! reuses particles.hsml as the Newton seed (do NOT zero it).
-        # `tree` is fresh-enough by the Verlet gate above.
-        tree = find_sph_quantities!(particles, param, problem, prob, kc;
-                                    tree = tree)
+        # iteration / right after a redistribution), then solves the SPH
+        # quantities (hsml/rho/varhsmlfac/rho_model) over the fresh-enough tree.
+        # hsml is reused as the Newton seed (never zeroed between iterations).
+        engine_density_solve!(engine, particles, param, problem, prob, kc, n,
+                              boxv, periodic)
 
         # --- 2. iteration / Maxiter ---------------------------------------
         it += 1
@@ -286,10 +380,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
                 end
                 # re-run the SPH solve after the moves; force a tree +
                 # candidate-list rebuild (positions jumped arbitrarily).
-                tree = find_sph_quantities!(particles, param, problem, prob,
-                                            kc; tree = nothing)
-                copyto!(ref_pos, particles.pos)
-                have_lists = false
+                engine_density_solve!(engine, particles, param, problem, prob,
+                                      kc, n, boxv, periodic; force = true)
             elseif verbose
                 println("Skipping redistribution at iteration ", it,
                         ": degenerate decay (denominator ", decay_denom,
@@ -301,8 +393,8 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
 
         # --- 5. relative-density-error stats ------------------------------
         errMin, errMax, errMean, errSigma =
-            _error_stats(particles, prob.density, n,
-                         param.density_function_correction, chunks)
+            engine_error_stats(engine, particles, prob, n,
+                               param.density_function_correction)
         errMean /= n
         errSigma = sqrt(max(0.0, errSigma / n - errMean * errMean))
         errDiff = (errLast - errMean) / errMean
@@ -316,36 +408,22 @@ function regularise_sph_particles!(particles::Particles, param::Parameters,
 
         # --- 6. model-density metric hsml + norm --------------------------
         max_hsml_norm, mean_hsml =
-            _model_hsml_metric!(particles, mhsml, prob.density, n,
-                                param.density_function_correction, wvtnngb,
-                                mpart, voln, dim, median_boxsize)
+            engine_model_hsml!(engine, particles, mhsml, prob, n,
+                               param.density_function_correction, wvtnngb,
+                               mpart, voln, dim, median_boxsize)
 
-        # --- Verlet skin: refresh the cached candidate lists --------------
-        # r_skin scales with the normalised model hsml — the radius the
-        # displacement loop probes (carried to the next iteration's rebuild
-        # gate). query_r ≥ the largest possible pair h = 0.5(hsml_i+hsml_j)
-        # plus the mutual-drift margin r_skin, so a neighbour can drift up to
-        # 2·(0.5·r_skin) before the gate forces a rebuild and the cached list
-        # is still a complete superset. The candidate lists are rebuilt exactly
-        # when the tree was rebuilt this iteration — never on stale positions.
-        r_skin = _skin_radius(mean_hsml)
-        query_r = max_hsml_norm * 1.05 + r_skin
-
-        if tree_rebuilt || !have_lists
-            _rebuild_candidate_lists!(cand_lists, particles.pos, tree,
-                                      query_r, boxv, periodic, wscratch,
-                                      chunks)
-            have_lists = true
-        end
-
-        # --- 7. WVT repulsive displacement --------------------------------
-        _wvt_displacement!(particles, mhsml, deltas, cand_lists, kc, step,
-                           boxv, periodic, dim, voln, chunks)
+        # --- 7. WVT repulsive displacement (+ Verlet candidate refresh) ---
+        # The engine refreshes its cached candidate lists at
+        # query_r = max_hsml_norm·1.05 + r_skin when its tree was rebuilt this
+        # iteration, then computes the per-particle displacement.
+        engine_displacement!(engine, particles, mhsml, deltas, kc, step,
+                             boxv, periodic, dim, voln, max_hsml_norm,
+                             mean_hsml, n)
 
         # --- 8. move + box wrap + moveMps ---------------------------------
         cnt, cnt1, cnt2, cnt3 =
-            _move_particles!(particles, deltas, desnngb, voln, dim,
-                             boxv, periodic, chunks)
+            engine_move!(engine, particles, deltas, desnngb, voln, dim,
+                         boxv, periodic)
         moveMps = (cnt * 100.0 / param.Npart, cnt1 * 100.0 / param.Npart,
                    cnt2 * 100.0 / param.Npart, cnt3 * 100.0 / param.Npart)
 

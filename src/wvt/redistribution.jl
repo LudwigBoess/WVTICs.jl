@@ -62,7 +62,7 @@ end
     relative_density_error(particles, prob, ipart,
                            density_function_correction) -> Float64
 
-Absolute value of [`relative_density_error_signed`](@ref).  Used by the WVT
+Absolute value of `relative_density_error_signed`.  Used by the WVT
 loop's error stats.
 """
 @inline function relative_density_error(particles::Particles, prob::Problem,

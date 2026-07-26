@@ -266,7 +266,7 @@ const PEANO_BITS = 21
     peano_keys(positions, box) -> Vector{Int}
 
 Per-particle 3-D Peano–Hilbert key (GadgetIO `peano_hilbert_key` /
-`get_int_pos`, [`PEANO_BITS`](@ref) resolution).  `box::NTuple{3,Float64}`
+`get_int_pos`, `PEANO_BITS` resolution).  `box::NTuple{3,Float64}`
 is the problem box; the curve is laid over `[0,box]` with the cube side =
 `max(box)` (so the integer grid is isotropic, matching GadgetIO's
 single-`domain_fac` convention).  Returns `Int` keys (fits in `Int64` for
@@ -412,7 +412,7 @@ Peano–Hilbert SFC domain decomposition (CLAUDE.md §4 point 1).  Computes PH
 keys ([`peano_keys`](@ref)), sorts `1:N` by key, and splits the sorted array
 into `nparts` contiguous, particle-count-balanced ranges via the recursive
 load-balanced bisection mirrored from PhysicalTrees `find_split_kernel`
-([`_find_split!`](@ref)).  Node-count agnostic: the split keys off `nparts`
+(`_find_split!`).  Node-count agnostic: the split keys off `nparts`
 only.
 
 Guarantees (asserted by the Phase-D tests): keys sorted within each
