@@ -304,7 +304,7 @@ function find_sph_quantities!(particles::Particles, param::Parameters,
 
     # Model density per particle (diagnostic / WVT target; uses the artificial
     # density-model correction param).
-    _fill_rho_model!(particles, prob, n, density_function_correction)
+    _fill_rho_model!(particles, prob.density, n, density_function_correction)
 
     nchunks = max(1, Threads.nthreads())
     chunks = _chunk_ranges(n, nchunks)
@@ -351,11 +351,11 @@ end
     return nothing
 end
 
-# Function barrier: isolate the `prob.density` ::Function-field call so the
-# loop stays type-stable (mirrors the Phase-1 `_mpart_slice` pattern).
-function _fill_rho_model!(particles::Particles, prob::Problem, n::Int,
-                          density_function_correction)
-    dfun = prob.density
+# Function barrier: the density callback is passed as `dfun::F` so the loop
+# specialises on its concrete type instead of dispatching on `prob.density`
+# (the abstract `::Function` field) every iteration.
+function _fill_rho_model!(particles::Particles, dfun::F, n::Int,
+                          density_function_correction) where {F}
     @inbounds for i in 1:n
         particles.rho_model[i] =
             Float32(dfun(particles, i, density_function_correction))

@@ -54,13 +54,20 @@ Port of `redistribution.c::relativeDensityErrorWithSign`:
 (`density_function_correction = param.density_function_correction`, C
 `Param.BiasCorrection`).  Ranges from −1 (ρ=0) to +∞ (ρ→∞).
 """
-@inline function relative_density_error_signed(particles::Particles,
-                                                prob::Problem, ipart::Int,
-                                                density_function_correction)
-    rho_model =
-        Float64(prob.density(particles, ipart, density_function_correction))
+# Inner form taking the density callback as `dfun::F`, so hot callers (the
+# redistribution probe loops) specialise on its concrete type instead of
+# dispatching on the abstract `prob.density` field each call.
+@inline function _rel_density_error_signed(particles::Particles, dfun::F,
+                                           ipart::Int,
+                                           density_function_correction) where {F}
+    rho_model = Float64(dfun(particles, ipart, density_function_correction))
     return (Float64(particles.rho[ipart]) - rho_model) / rho_model
 end
+
+@inline relative_density_error_signed(particles::Particles, prob::Problem,
+                                       ipart::Int, density_function_correction) =
+    _rel_density_error_signed(particles, prob.density, ipart,
+                              density_function_correction)
 
 """
     relative_density_error(particles, prob, ipart,
@@ -144,10 +151,19 @@ function redistribute_particles!(particles::Particles, param::Parameters,
                                  seed::Integer = RNG_BASE_SEED)
     n = param.Npart
     (n <= 0 || move_part <= 0 || max_probes <= 0) && return (0, 0)
+    return _redistribute!(particles, prob.density, n,
+                          param.density_function_correction,
+                          problem.Boxsize, problem.Periodic,
+                          move_part, max_probes, seed)
+end
 
-    density_function_correction = param.density_function_correction
-    box = problem.Boxsize
-    per = problem.Periodic
+# Function barrier holding the whole probe loop, specialised on the density
+# callback type `F` so the accept-test density calls dispatch statically.
+@noinline function _redistribute!(particles::Particles, dfun::F, n::Int,
+                                  density_function_correction,
+                                  box::NTuple{3,Float64}, per::NTuple{3,Bool},
+                                  move_part::Int, max_probes::Int,
+                                  seed::Integer) where {F}
     rng = Random.Xoshiro(seed)
 
     redist = 0
@@ -170,7 +186,7 @@ function redistribute_particles!(particles::Particles, param::Parameters,
                 break
             end
             probes += 1
-            if rand(rng) < _erf(relative_density_error_signed(particles, prob,
+            if rand(rng) < _erf(_rel_density_error_signed(particles, dfun,
                                               cand, density_function_correction))
                 # acceptParticleForMovement passed: claim it (it is still
                 # untouched — serial selection guarantees no race here).
@@ -187,7 +203,7 @@ function redistribute_particles!(particles::Particles, param::Parameters,
         jpart = _random_particle(rng, n)
         guard = 0
         while particles.redistributed[jpart] ||
-              !(rand(rng) < -relative_density_error_signed(particles, prob,
+              !(rand(rng) < -_rel_density_error_signed(particles, dfun,
                                             jpart, density_function_correction))
             jpart = _random_particle(rng, n)
             guard += 1

@@ -242,8 +242,14 @@ to every particle, writing `particles.vel` (stored `Float32`, matching the C
 function make_velocities!(particles::Particles, param::Parameters,
                           problem::ProblemParameters)
     prob = setup_problem(param)
-    @inbounds for ipart in 1:param.Npart
-        v = prob.velocity(particles, ipart)
+    _apply_velocities!(particles, prob.velocity, param.Npart)
+    return nothing
+end
+
+@noinline function _apply_velocities!(particles::Particles, vfun::F,
+                                      n::Int) where {F}
+    @inbounds for ipart in 1:n
+        v = vfun(particles, ipart)
         particles.vel[ipart] = SVector{3,Float32}(v[1], v[2], v[3])
     end
     return nothing
@@ -257,8 +263,14 @@ callback, writing `particles.u` (`Float32`, as C `SphP.U`).
 function make_temperatures!(particles::Particles, param::Parameters,
                             problem::ProblemParameters)
     prob = setup_problem(param)
-    @inbounds for ipart in 1:param.Npart
-        particles.u[ipart] = Float32(prob.internal_energy(particles, ipart))
+    _apply_internal_energy!(particles, prob.internal_energy, param.Npart)
+    return nothing
+end
+
+@noinline function _apply_internal_energy!(particles::Particles, ufun::F,
+                                           n::Int) where {F}
+    @inbounds for ipart in 1:n
+        particles.u[ipart] = Float32(ufun(particles, ipart))
     end
     return nothing
 end
@@ -271,8 +283,14 @@ callback, writing `particles.bfld` (`Float32`, as C `SphP.Bfld`).
 function make_magnetic_fields!(particles::Particles, param::Parameters,
                                problem::ProblemParameters)
     prob = setup_problem(param)
-    @inbounds for ipart in 1:param.Npart
-        b = prob.bfield(particles, ipart)
+    _apply_magnetic_fields!(particles, prob.bfield, param.Npart)
+    return nothing
+end
+
+@noinline function _apply_magnetic_fields!(particles::Particles, bfun::F,
+                                           n::Int) where {F}
+    @inbounds for ipart in 1:n
+        b = bfun(particles, ipart)
         particles.bfld[ipart] = SVector{3,Float32}(b[1], b[2], b[3])
     end
     return nothing
