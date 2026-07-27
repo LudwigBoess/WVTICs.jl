@@ -2900,4 +2900,103 @@ end
         end
     end
 
+    @testset "6. Live distributed relaxation parity (≥2 workers)" begin
+        # Spin up LOCAL workers and run the REAL distributed relaxation (not a
+        # serial delegation) against the serial reference. No scheduler; tiny N;
+        # rmprocs in a finally.
+        added = Int[]
+        try
+            proj = Base.active_project()
+            added = addprocs(3; exeflags = "--project=$(proj)")
+            @everywhere added using WVTICs
+            @everywhere added using StaticArrays
+            @test nworkers() == 3
+
+            # -- ghost sufficiency, live -----------------------------------
+            # Run the driver's own density solve, then assert that the halo it
+            # actually exchanged (`slice_gids`) covers every owned particle's
+            # global-KDTree neighbours within 2·hsml — incl. across periodic
+            # faces. This checks the live exchange wired into the engine (test 2
+            # only checks the `select_ghosts` helper in isolation).
+            ps, param, problem, prob, kc, N, L = _pd_setup(6; maxiter = 3)
+            param.RedistributionFrequency = 1_000_000
+            _fillpd!(ps, N, L, 321)
+            eng = WVTICs.DistributedEngine(ps, problem)
+            WVTICs.engine_density_solve!(eng, ps, param, problem, prob, kc, N,
+                                         problem.Boxsize, problem.Periodic)
+            box = problem.Boxsize
+            per = problem.Periodic
+            tree = WVTICs.build_tree(ps.pos)
+            for w in 1:length(eng.owned)
+                isempty(eng.owned[w]) && continue
+                sliceset = Set(eng.slice_gids[w])
+                for g in eng.owned[w]
+                    r = 2.0 * Float64(ps.hsml[g])
+                    buf = Int[]
+                    tmp = Int[]
+                    WVTICs.query_candidates!(buf, tmp, tree, ps.pos, ps.pos[g],
+                                             r, box, per)
+                    for j in buf
+                        j == g && continue
+                        if WVTICs.periodic_dist2(ps.pos[g], ps.pos[j],
+                                                 box, per) <= r * r
+                            @test j in sliceset
+                        end
+                    end
+                end
+            end
+
+            # -- no-redistribution per-particle parity ---------------------
+            # Complete ghosts + the coordinator-side model-hsml/move ⇒ pos, rho
+            # and hsml match serial per particle to ~1e-10 (they match bit-for-
+            # bit here; the bar is loose head-room). Checked at 3 then 2 workers
+            # to catch off-by-one in multi-slot ghost assembly.
+            for np in (3, 2)
+                while nworkers() > np
+                    rmprocs(workers()[end])
+                end
+                @test nworkers() == np
+                psS, pS, prS, prbS, kcS, Nn, Ln = _pd_setup(6; maxiter = 4)
+                psD, pD, prD, prbD, kcD, _, _ = _pd_setup(6; maxiter = 4)
+                pS.RedistributionFrequency = 1_000_000   # never redistribute
+                pD.RedistributionFrequency = 1_000_000
+                _fillpd!(psS, Nn, Ln, 909)
+                _fillpd!(psD, Nn, Ln, 909)
+                WVTICs.regularise_sph_particles!(psS, pS, prS, prbS, kcS;
+                    output_diagnostics = false, verbose = false)
+                WVTICs.regularise_sph_particles_distributed!(psD, pD, prD, prbD,
+                    kcD; output_diagnostics = false, verbose = false)
+                dpos = maximum(maximum(abs, psS.pos[i] - psD.pos[i])
+                               for i in 1:Nn)
+                drho = maximum(abs(psS.rho[i] - psD.rho[i]) /
+                               abs(psS.rho[i]) for i in 1:Nn)
+                dhsml = maximum(abs(psS.hsml[i] - psD.hsml[i]) /
+                                abs(psS.hsml[i]) for i in 1:Nn)
+                @test dpos <= 1e-10
+                @test drho <= 1e-10
+                @test dhsml <= 1e-10
+            end
+
+            # -- with-redistribution statistical parity --------------------
+            # Redistribution runs on the coordinator (the verified serial
+            # Metropolis kernel), so the converged mean error matches serial;
+            # the bar is the documented rtol ≤ 1e-6. (nworkers() == 2 here.)
+            psS, pS, prS, prbS, kcS, Nn, Ln = _pd_setup(6; maxiter = 12)
+            psD, pD, prD, prbD, kcD, _, _ = _pd_setup(6; maxiter = 12)
+            _fillpd!(psS, Nn, Ln, 2718)
+            _fillpd!(psD, Nn, Ln, 2718)
+            WVTICs.regularise_sph_particles!(psS, pS, prS, prbS, kcS;
+                output_diagnostics = false, verbose = false)
+            WVTICs.regularise_sph_particles_distributed!(psD, pD, prD, prbD, kcD;
+                output_diagnostics = false, verbose = false)
+            eS = merrpd(psS, prbS, Nn, pS.density_function_correction)
+            eD = merrpd(psD, prbD, Nn, pD.density_function_correction)
+            @test isfinite(eD)
+            @test isapprox(eD, eS; rtol = 1e-6)
+        finally
+            nworkers() >= 1 && rmprocs(workers())
+        end
+        @test nprocs() == 1                  # pool restored
+    end
+
 end
