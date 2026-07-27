@@ -287,6 +287,37 @@ const ICS_PAR = "/e/ocean2/users/lboess/WVTICs/ics.par"
         end
     end
 
+    @testset "make_sph_wvtics num_files splits the snapshot" begin
+        # The driver routes output through write_output_distributed: num_files
+        # defaults to a single file; num_files > 1 writes a Gadget multi-file
+        # set (global nall + num_files in every header).
+        mktempdir() do dir
+            cfg = read(ICS_PAR, String)
+            cfg = replace(cfg, r"(?m)^Npart\s+\d+"   => "Npart      512")
+            cfg = replace(cfg, r"(?m)^Maxiter\s+\d+" => "Maxiter 1")
+            par = joinpath(dir, "ics_small.par")
+            write(par, cfg)
+            cd(dir) do
+                # default ⇒ one file, no suffix
+                ps1 = make_sph_wvtics(par; verbose = false)
+                @test isfile(joinpath(dir, "IC_Constant_Density"))
+
+                # num_files = 3 ⇒ IC_Constant_Density.0/.1/.2
+                ps3 = make_sph_wvtics(par; verbose = false, num_files = 3)
+                files = [joinpath(dir, "IC_Constant_Density.$(k)") for k in 0:2]
+                @test all(isfile, files)
+                total = 0
+                for fp in files
+                    h = read_header(fp)
+                    total += Int(h.npart[1])
+                    @test Int(h.nall[1]) == length(ps3)      # global total
+                    @test Int(h.num_files) == 3
+                end
+                @test total == length(ps3)                   # per-file sum
+            end
+        end
+    end
+
 end
 
 @testset "WVTICs.jl Phase 1" begin

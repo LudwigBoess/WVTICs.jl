@@ -79,8 +79,9 @@ full IC-generation pipeline:
 
 ```
 read_param_file -> setup -> make_positions! -> make_ids!
-  -> regularise_sph_particles! -> make_velocities! -> make_temperatures!
-  -> make_magnetic_fields! -> make_post_processing! -> write_output
+  -> regularise_sph_particles![_distributed!] -> make_velocities!
+  -> make_temperatures! -> make_magnetic_fields! -> make_post_processing!
+  -> write_output_distributed
 ```
 
 The SPH `kernel` (and its dimension / `DESNNGB` / `NNGBDEV` / `NGBMAX`) is
@@ -94,11 +95,21 @@ instance with `KernelConfig(SPHKernels.WendlandC6(Float64, 3); desnngb = 295)`
 If the parameter file sets `DesNumNgb > 0` it overrides the kernel's target
 neighbour count (`DESNNGB`) for this run.
 
+`distributed = true` runs the relaxation across `nworkers()` worker processes
+via [`regularise_sph_particles_distributed!`](@ref) (which delegates to the
+serial path when no workers are present — set them up with
+[`init_workers`](@ref) / `addprocs` + `@everywhere using WVTICs` first).
+`num_files > 1` writes the snapshot as that many Gadget files
+([`write_output_distributed`](@ref)); the default `num_files = 1` writes a
+single file. Both default to the serial single-file behaviour.
+
 Returns the [`Particles`](@ref) container.
 """
 function make_sph_wvtics(parfile::AbstractString;
                          kernel::KernelConfig = default_kernel_config(),
-                         verbose::Bool = true)
+                         verbose::Bool = true,
+                         distributed::Bool = false,
+                         num_files::Integer = 1)
     verbose && println("--- This is WVT ICs (Julia port), Version $(VERSION_STR) ---")
 
     param = read_param_file(parfile)
@@ -115,8 +126,15 @@ function make_sph_wvtics(parfile::AbstractString;
     make_positions!(particles, param, problem)
     make_ids!(particles, param)
 
-    regularise_sph_particles!(particles, param, problem, setup_problem(param),
-                              kernel; verbose = verbose)
+    if distributed
+        regularise_sph_particles_distributed!(particles, param, problem,
+                                              setup_problem(param), kernel;
+                                              verbose = verbose)
+    else
+        regularise_sph_particles!(particles, param, problem,
+                                  setup_problem(param), kernel;
+                                  verbose = verbose)
+    end
 
     make_velocities!(particles, param, problem)
     make_temperatures!(particles, param, problem)
@@ -126,7 +144,8 @@ function make_sph_wvtics(parfile::AbstractString;
     # The artificial density-model correction is a diagnostic print only and is
     # not computed here.
 
-    write_output(particles, param, problem; verbose = verbose)
+    write_output_distributed(particles, param, problem;
+                             num_files = num_files, verbose = verbose)
 
     verbose && println("done")
     return particles
