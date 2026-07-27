@@ -2550,31 +2550,33 @@ end
             sortedkeys = keys[d.order]
             @test issorted(sortedkeys)
 
-            # partitions contiguous, disjoint, union == 1:N
+            # partitions contiguous, disjoint, union == 1:N (aggregated to a
+            # single assertion each — the per-particle checks are folded in).
             covered = Set{Int}()
             total = 0
             ranges = Tuple{Int,Int}[]
+            disjoint = true
             for w in 1:length(d.bounds)
                 f, l = d.bounds[w]
                 if l >= f
                     push!(ranges, (f, l))
                     for p in f:l
                         g = d.order[p]
-                        @test !(g in covered)         # disjoint
+                        disjoint &= !(g in covered)
                         push!(covered, g)
                     end
                     total += l - f + 1
                 end
             end
+            @test disjoint
             @test total == N
             @test length(covered) == N                # union == all
             # contiguity: ranges tile 1:N with no gap/overlap
             sort!(ranges, by = first)
             @test ranges[1][1] == 1
             @test ranges[end][2] == N
-            for t in 2:length(ranges)
-                @test ranges[t][1] == ranges[t-1][2] + 1
-            end
+            @test all(ranges[t][1] == ranges[t-1][2] + 1
+                      for t in 2:length(ranges))
 
             # particle-count balance: each non-empty slot within a small
             # tolerance of N/np (recursive bisection ⇒ ≤ 1 per level, but a
@@ -2585,12 +2587,9 @@ end
             @test minimum(counts) >= 1
 
             # owner[] consistency with bounds
-            for w in 1:length(d.bounds)
-                f, l = d.bounds[w]
-                for p in f:l
-                    @test d.owner[d.order[p]] == w
-                end
-            end
+            @test all(d.owner[d.order[p]] == w
+                      for w in 1:length(d.bounds)
+                      for p in d.bounds[w][1]:d.bounds[w][2])
         end
     end
 
@@ -2613,20 +2612,21 @@ end
         d = WVTICs.decompose_domain(ps.pos, box, nparts)
         gmax = 2.0 * maximum(Float64.(ps.hsml))
 
+        # every owned particle's true neighbours within 2·hsml must be in its
+        # worker's owned⋃ghost set. Aggregated: count violations across all
+        # workers/particles/neighbours, assert zero.
+        width_ok = true
+        missing = 0
         for w in 1:length(d.bounds)
             f, l = d.bounds[w]
             l < f && continue
             owned = Int[d.order[p] for p in f:l]
             lo, hi = WVTICs._aabb(ps.pos, owned)
             width = WVTICs._halo_width(ps.hsml, owned)
-            @test isapprox(width, gmax; atol = 1e-12) ||
-                  width <= gmax + 1e-12      # per-boundary ≤ global 2·max
+            width_ok &= width <= gmax + 1e-12       # per-boundary ≤ global 2·max
             ghidx = WVTICs.select_ghosts(ps.pos, lo, hi, width, box, per)
             local_set = Set(owned)
             union!(local_set, Set(ghidx))
-
-            # every owned particle's true neighbours within 2·hsml are in the
-            # owned⋃ghost set (the per-worker engine can find them locally).
             for g in owned
                 r = 2.0 * Float64(ps.hsml[g])
                 buf = Int[]
@@ -2636,12 +2636,14 @@ end
                 for j in buf
                     j == g && continue
                     if WVTICs.periodic_dist2(ps.pos[g], ps.pos[j],
-                                             box, per) <= r * r
-                        @test j in local_set
+                                             box, per) <= r * r && !(j in local_set)
+                        missing += 1
                     end
                 end
             end
         end
+        @test width_ok
+        @test missing == 0
 
         # ghost width covers 2·max(hsml): a particle exactly at distance
         # `width` from the AABB is selected (boundary-inclusive).
@@ -2927,6 +2929,7 @@ end
             box = problem.Boxsize
             per = problem.Periodic
             tree = WVTICs.build_tree(ps.pos)
+            missing = 0                          # neighbours absent from a slice
             for w in 1:length(eng.owned)
                 isempty(eng.owned[w]) && continue
                 sliceset = Set(eng.slice_gids[w])
@@ -2939,12 +2942,14 @@ end
                     for j in buf
                         j == g && continue
                         if WVTICs.periodic_dist2(ps.pos[g], ps.pos[j],
-                                                 box, per) <= r * r
-                            @test j in sliceset
+                                                 box, per) <= r * r &&
+                           !(j in sliceset)
+                            missing += 1
                         end
                     end
                 end
             end
+            @test missing == 0
 
             # -- no-redistribution per-particle parity ---------------------
             # Complete ghosts + the coordinator-side model-hsml/move ⇒ pos, rho
