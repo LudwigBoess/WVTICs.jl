@@ -34,9 +34,10 @@
 #    kernels. Redistribution (Metropolis, global) runs the serial
 #    `redistribute_particles!` on the coordinator, then re-solves.
 #
-# IO (`write_output_distributed`) writes one Gadget file per non-empty slice
-# or, for `single_file`, gathers to a single file. Worker launch
-# (`init_workers`) is pluggable: local `addprocs`, or `SlurmManager`/
+# IO (`write_output_distributed`) writes the snapshot across `num_files` Gadget
+# files (default 1 = single file), each header carrying the global count in
+# `nall` + high-word. Worker launch (`init_workers`) is pluggable: local
+# `addprocs`, or `SlurmManager`/
 # `PBSManager` via ClusterManagers, with `:auto` detecting the scheduler from
 # the environment. The ClusterManagers import lives only in this file.
 # ===========================================================================
@@ -976,50 +977,47 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    write_output_distributed(particles, param, problem, decomp;
-        filename=problem.Name, single_file=false, kwargs...) -> Vector{String}
+    write_output_distributed(particles, param, problem;
+        num_files = 1, filename = problem.Name, verbose = false,
+        output_diagnostics = true) -> Vector{String}
 
-Per-worker multi-file Gadget snapshot. Writes one SnapFormat-2 file per
-non-empty decomposition slice (`filename.0 … filename.{k-1}`) holding that
-slice's owned particles, so the set reads back via
-`GadgetIO.read_header`/`read_block` and the per-file `npart[1]` sum to the
-correct *global* particle count. `single_file=true` (or one slice) gathers to
-a single file via the serial [`write_output`](@ref). Paths are taken as given
-(absolute / shared-FS — no localhost assumption). `kwargs` forward to
-`write_output`.
+Write the snapshot across `num_files` Gadget SnapFormat-2 files.
 
-Each per-worker file's header records *that file's* particle count in both
-`npart[1]` and `nall[1]` with `num_files = 1` (the WVTICs snapshot writer is
-single-file by design). This is a valid standalone snapshot per file and the
-slice union is loss-free; it is not the Gadget convention of a global `nall`
-+ `num_files = k` across the set. For a single canonical file use
-`single_file = true`.
+`num_files = 1` (the default) writes a single self-contained file at `filename`
+via [`write_output`](@ref). `num_files > 1` (clamped to `Npart`) decomposes the
+particles by Peano key into that many contiguous spatial slices and writes one
+file per slice (`filename.0 … filename.{num_files-1}`). Every file's header
+carries the global particle count in `nall` + `npartTotalHighWord` and the file
+count in `num_files`, so the set reads back as one Gadget multi-file snapshot
+(`npart[1]` per file sum to the global total). Returns the paths written; paths
+are taken as given (absolute / shared-FS — no localhost assumption).
 """
 function write_output_distributed(particles::Particles, param::Parameters,
-                                  problem::ProblemParameters,
-                                  decomp::Decomposition;
+                                  problem::ProblemParameters;
+                                  num_files::Integer = 1,
                                   filename::AbstractString = problem.Name,
-                                  single_file::Bool = false,
                                   verbose::Bool = false,
-                                  kwargs...)
-    nparts = length(decomp.bounds)
-    nonempty = [w for w in 1:nparts if decomp.bounds[w][2] >= decomp.bounds[w][1]]
-    if single_file || length(nonempty) <= 1
-        write_output(particles, param, problem;
-                     filename = filename, verbose = verbose, kwargs...)
+                                  output_diagnostics::Bool = true)
+    ntot = param.Npart
+    nfiles = clamp(Int(num_files), 1, max(1, ntot))
+    if nfiles <= 1
+        write_output(particles, param, problem; filename = filename,
+                     verbose = verbose, output_diagnostics = output_diagnostics)
         return String[filename]
     end
+    order = snapshot_block_order(; output_diagnostics = output_diagnostics)
+    decomp = decompose_domain(particles.pos, problem.Boxsize, nfiles)
     written = String[]
-    for (k, w) in enumerate(nonempty)
-        f, l = decomp.bounds[w]
+    for k in 1:nfiles
+        f, l = decomp.bounds[k]
         gids = Int[decomp.order[p] for p in f:l]
         sub = _subset_particles(particles, gids)
-        subparam = deepcopy(param)
-        subparam.Npart = length(gids)        # this file's count
-        subprob = deepcopy(problem)
+        header = build_snapshot_header(param, problem;
+                                       npart_file = length(gids),
+                                       nall_total = ntot, num_files = nfiles)
         path = string(filename, ".", k - 1)
-        write_output(sub, subparam, subprob;
-                     filename = path, verbose = verbose, kwargs...)
+        _write_snapshot_file(path, sub, length(gids), header, order;
+                             verbose = verbose)
         push!(written, path)
     end
     return written

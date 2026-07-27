@@ -85,19 +85,35 @@ function _block_data(particles::Particles, b::Symbol, n::Int)
 end
 
 """
-    build_snapshot_header(param, problem) -> SnapshotHeader
+    build_snapshot_header(param, problem;
+                          npart_file = param.Npart, nall_total = param.Npart,
+                          num_files = 1) -> SnapshotHeader
 
-Build the snapshot header. All particles are type 0 (gas):
-`npart[1] = nall[1] = Npart`, `massarr[1] = Mpart`, `boxsize = Boxsize[1]`
-(the largest axis), cosmology fields 0, `num_files = 1`. (`SnapshotHeader`
+Build the snapshot header. All particles are type 0 (gas): `massarr[1] = Mpart`,
+`boxsize = Boxsize[1]` (the largest axis), cosmology fields 0. (`SnapshotHeader`
 vectors are 1-based; index 1 is type 0.)
+
+* `npart_file` — this file's particle count (`npart[1]`).
+* `nall_total` — the total particle count across all files. Its low 32 bits go
+  in `nall[1]` and its high 32 bits in `npartTotalHighWord[1]`, so totals above
+  `2^32 - 1` survive the 32-bit `nall` field (the Gadget high-word convention).
+* `num_files` — number of files the snapshot is split across.
+
+Defaults reproduce a single self-contained file (`npart = nall = Npart`,
+`num_files = 1`).
 """
-function build_snapshot_header(param::Parameters, problem::ProblemParameters)
+function build_snapshot_header(param::Parameters, problem::ProblemParameters;
+                               npart_file::Integer = param.Npart,
+                               nall_total::Integer = param.Npart,
+                               num_files::Integer = 1)
     npart = zeros(Int32, 6)
     nall = zeros(UInt32, 6)
+    nall_high = zeros(UInt32, 6)
     massarr = zeros(Float64, 6)
-    npart[1] = Int32(param.Npart)
-    nall[1] = UInt32(param.Npart)
+    npart[1] = Int32(npart_file)
+    nt = UInt64(nall_total)
+    nall[1] = UInt32(nt & 0xffffffff)          # low 32 bits
+    nall_high[1] = UInt32(nt >> 32)            # high 32 bits (counts ≥ 2^32)
     massarr[1] = problem.Mpart
 
     return SnapshotHeader(
@@ -109,14 +125,14 @@ function build_snapshot_header(param::Parameters, problem::ProblemParameters)
         Int32(0),                    # flag_feedback
         nall,                        # nall
         Int32(0),                    # flag_cooling
-        Int32(1),                    # num_files
+        Int32(num_files),            # num_files
         problem.Boxsize[1],          # boxsize (largest axis)
         0.0,                         # omega_0
         0.0,                         # omega_l
         0.0,                         # h0
         Int32(0),                    # flag_stellarage
         Int32(0),                    # flag_metals
-        zeros(UInt32, 6),            # npartTotalHighWord
+        nall_high,                   # npartTotalHighWord
         Int32(0),                    # flag_entropy_instead_u
         Int32(0),                    # flag_doubleprecision
         Int32(0),                    # flag_ic_info
@@ -146,15 +162,23 @@ function write_output(particles::Particles, param::Parameters,
     n = param.Npart
     order = snapshot_block_order(; output_diagnostics = output_diagnostics)
     header = build_snapshot_header(param, problem)
-    info = snapshot_info_lines(order)
+    return _write_snapshot_file(filename, particles, n, header, order;
+                                verbose = verbose)
+end
 
+# Write one SnapFormat-2 file: HEAD, the custom INFO block, then the `order`
+# data blocks. `header` carries this file's `npart`/`nall`/`num_files`; `n` is
+# this file's particle count. Shared by the single-file and multi-file writers.
+function _write_snapshot_file(filename::AbstractString, particles::Particles,
+                              n::Int, header, order::Vector{Symbol};
+                              verbose::Bool = true)
+    info = snapshot_info_lines(order)
     if verbose
         println("Output :")
         println("   File Name = ", filename)
         println("   Npart     = ", n)
         println("   Blocks    = ", join(string.(order), ", "))
     end
-
     f = open(filename, "w")
     try
         write_header(f, header; snap_format = 2)
@@ -166,7 +190,6 @@ function write_output(particles::Particles, param::Parameters,
     finally
         close(f)
     end
-
     verbose && println("done")
     return filename
 end

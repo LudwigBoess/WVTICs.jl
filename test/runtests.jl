@@ -2863,7 +2863,7 @@ end
         @test nprocs() == 1                  # pool restored
     end
 
-    @testset "5. Per-worker multi-file IO round-trips total Npart" begin
+    @testset "5. Multi-file IO: Gadget-conventional headers round-trip" begin
         ps, param, problem, prob, kc, N, L = _pd_setup(7)   # N = 343
         _fillpd!(ps, N, L, 2)
         for i in 1:N
@@ -2872,8 +2872,8 @@ end
         end
         mktempdir() do dir
             base = joinpath(dir, "IC_PhaseD")
-            d = WVTICs.decompose_domain(ps.pos, problem.Boxsize, 3)
-            files = WVTICs.write_output_distributed(ps, param, problem, d;
+            files = WVTICs.write_output_distributed(ps, param, problem;
+                                                    num_files = 3,
                                                     filename = base,
                                                     verbose = false)
             @test length(files) == 3
@@ -2883,23 +2883,51 @@ end
             allids = Int[]
             for fp in files
                 h = read_header(fp)
-                total += Int(h.npart[1])
+                total += Int(h.npart[1])           # per-file count
+                @test Int(h.nall[1]) == N          # global total in every file
+                @test Int(h.num_files) == 3        # file count in every file
+                @test Int(h.npartTotalHighWord[1]) == 0   # N < 2^32
                 ids = read_block(fp, "ID"; parttype = 0)
                 append!(allids, Int.(ids))
             end
-            @test total == N                       # total particle count
+            @test total == N                       # per-file counts sum to N
             @test sort(allids) == collect(1:N)     # every id once, no loss
 
-            # single_file=true gathers to one file with the full count.
+            # num_files = 1 (default) writes a single self-contained file.
             single = joinpath(dir, "IC_single")
-            sf = WVTICs.write_output_distributed(ps, param, problem, d;
+            sf = WVTICs.write_output_distributed(ps, param, problem;
                                                  filename = single,
-                                                 single_file = true,
                                                  verbose = false)
             @test length(sf) == 1
+            @test sf[1] == single                  # no ".0" suffix
             hs = read_header(sf[1])
             @test Int(hs.npart[1]) == N
+            @test Int(hs.nall[1]) == N
+            @test Int(hs.num_files) == 1
+
+            # more files than particles ⇒ clamped to Npart, still consistent.
+            capped = WVTICs.write_output_distributed(ps, param, problem;
+                                                     num_files = N + 5,
+                                                     filename =
+                                                     joinpath(dir, "IC_cap"),
+                                                     verbose = false)
+            @test length(capped) == N
+            @test sum(Int(read_header(fp).npart[1]) for fp in capped) == N
         end
+
+        # high-word: a global total ≥ 2^32 splits across nall (low 32 bits) and
+        # npartTotalHighWord (high 32 bits) — the count can't be exercised with
+        # real particles, so check the header builder directly.
+        big = Int(2)^32 + 7
+        hbig = WVTICs.build_snapshot_header(param, problem;
+                                            npart_file = 10, nall_total = big,
+                                            num_files = 4)
+        @test Int(hbig.npart[1]) == 10
+        @test hbig.nall[1] == UInt32(7)                  # low word
+        @test hbig.npartTotalHighWord[1] == UInt32(1)    # high word
+        @test UInt64(hbig.nall[1]) +
+              (UInt64(hbig.npartTotalHighWord[1]) << 32) == UInt64(big)
+        @test Int(hbig.num_files) == 4
     end
 
     @testset "6. Live distributed relaxation parity (≥2 workers)" begin
